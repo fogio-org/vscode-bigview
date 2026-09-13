@@ -8,9 +8,11 @@
  */
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { ChunkReader } from '../../src/core/ChunkReader';
 import { FileHandlePool } from '../../src/core/FileHandlePool';
+import { IndexStore, restoreLineIndex } from '../../src/core/IndexStore';
 import { LineIndex } from '../../src/core/LineIndex';
 import { WorkerPool } from '../../src/workers/workerPool';
 import { parseSize, type GenerateResult } from '../fixtures/generate';
@@ -31,18 +33,20 @@ async function main(): Promise<void> {
   const big = size > 2 * GB;
   const root = path.resolve(__dirname, '../..');
   const file = path.join(root, 'test', '.tmp', `bench-${sizeArg ?? '1g'}.log`);
-
   const gen = ensureFixture(root, file, size);
 
   const baselineRss = process.memoryUsage().rss;
   let peakRss = baselineRss;
-  const sampler = setInterval(() => (peakRss = Math.max(peakRss, process.memoryUsage().rss)), 20);
+  const sampler = setInterval(() => (peakRss = Math.max(peakRss, process.memoryUsage().rss)), 10);
 
   const pool = new FileHandlePool();
   const workers = new WorkerPool(path.join(root, 'dist'));
+  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bigview-bench-'));
+  const store = new IndexStore(storeDir);
+
+  // 1. Cold: scan with the worker.
   const index = new LineIndex();
   const reader = new ChunkReader(pool, file, index);
-
   const t0 = performance.now();
   let firstPageMs: number | undefined;
   let firstPage: Promise<void> | undefined;
@@ -58,32 +62,38 @@ async function main(): Promise<void> {
   await firstPage;
   if (outcome.status !== 'done') throw new Error('indexing did not finish');
 
-  const jumps: number[] = [];
-  for (let i = 0; i < 500; i++) {
-    const line = Math.floor(Math.random() * index.lineCount);
-    const s = performance.now();
-    await reader.readLines(line, 100);
-    jumps.push(performance.now() - s);
-  }
-  jumps.sort((a, b) => a - b);
+  const gotoMs = await measureGoto(reader, index.lineCount);
+
+  // 2. Persist and reload from the sidecar.
+  await store.save(file, { fileSize: outcome.fileSize, mtimeMs: outcome.mtimeMs, stride: index.stride, anchors: index.toFloat64Array() });
+  const sidecarBytes = fs.statSync(store.pathFor(file)).size;
+  const st = fs.statSync(file);
+  const tc = performance.now();
+  const restored = await restoreLineIndex(store, pool, file, st);
+  const cacheMs = performance.now() - tc;
+  if (!restored || restored.lineCount !== index.lineCount) throw new Error('cache restore mismatch');
+  const cachedGotoMs = await measureGoto(new ChunkReader(pool, file, restored), restored.lineCount);
+
   clearInterval(sampler);
   peakRss = Math.max(peakRss, process.memoryUsage().rss);
 
-  const p99 = jumps[Math.floor(jumps.length * 0.99)] ?? 0;
   const rows: Row[] = [
     { metric: 'First page (before index ready)', value: ms(firstPageMs), limit: '< 300 ms', ok: (firstPageMs ?? Infinity) < 300 },
     { metric: 'Index build', value: ms(indexMs), limit: big ? '< 60 s' : '< 12 s', ok: indexMs < (big ? 60_000 : 12_000) },
+    { metric: 'Index load from disk cache', value: ms(cacheMs), limit: 'instant', ok: undefined },
     { metric: 'Scroll 60 fps', value: 'manual', limit: '60 fps', ok: undefined },
     { metric: 'Literal search, whole file', value: 'n/a (M3)', limit: big ? '< 30 s' : '< 6 s', ok: undefined },
     { metric: 'Peak RSS', value: `${Math.round(peakRss / MB)} MB`, limit: big ? '< 400 MB' : '< 250 MB', ok: peakRss < (big ? 400 : 250) * MB },
-    { metric: 'Go to line (p99 of 500, 100 lines)', value: ms(p99), limit: '< 50 ms', ok: p99 < 50 },
+    { metric: 'Go to line, scanned (p99, 100 lines)', value: ms(gotoMs), limit: '< 50 ms', ok: gotoMs < 50 },
+    { metric: 'Go to line, cached (p99, 100 lines)', value: ms(cachedGotoMs), limit: '< 50 ms', ok: cachedGotoMs < 50 },
   ];
 
   console.log(
-    `\nFile: ${(gen.bytes / MB).toFixed(0)} MB, ${gen.lines.toLocaleString()} lines, ` +
-      `index ${(index.memoryBytes / MB).toFixed(0)} MB, baseline RSS ${Math.round(baselineRss / MB)} MB\n`,
+    `\nFile: ${(gen.bytes / MB).toFixed(0)} MB, ${gen.lines.toLocaleString('en-US')} lines, stride ${index.stride}, ` +
+      `${index.anchorCount.toLocaleString('en-US')} anchors (${(index.memoryBytes / MB).toFixed(0)} MB pages), ` +
+      `sidecar ${(sidecarBytes / MB).toFixed(1)} MB, baseline RSS ${Math.round(baselineRss / MB)} MB\n`,
   );
-  const w = [36, 14, 10];
+  const w = [40, 14, 10];
   console.log(`${'Metric'.padEnd(w[0]!)}${'Value'.padEnd(w[1]!)}${'Limit'.padEnd(w[2]!)}Result`);
   for (const r of rows) {
     const verdict = r.ok === undefined ? '-' : r.ok ? 'PASS' : 'FAIL';
@@ -92,7 +102,20 @@ async function main(): Promise<void> {
 
   pool.dispose();
   workers.dispose();
+  fs.rmSync(storeDir, { recursive: true, force: true });
   if (rows.some((r) => r.ok === false)) process.exitCode = 1;
+}
+
+async function measureGoto(reader: ChunkReader, lineCount: number): Promise<number> {
+  const times: number[] = [];
+  for (let i = 0; i < 500; i++) {
+    const line = Math.floor(Math.random() * lineCount);
+    const s = performance.now();
+    await reader.readLines(line, 100);
+    times.push(performance.now() - s);
+  }
+  times.sort((a, b) => a - b);
+  return times[Math.floor(times.length * 0.99)] ?? 0;
 }
 
 /**

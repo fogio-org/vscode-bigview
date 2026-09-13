@@ -4,12 +4,17 @@ import type { LineIndex } from '../core/LineIndex';
 import type { IndexerMessage, IndexerWorkerData } from './types';
 
 export type IndexOutcome =
-  | { status: 'done'; fileSize: number; elapsedMs: number }
+  | { status: 'done'; fileSize: number; mtimeMs: number; elapsedMs: number }
   | { status: 'cancelled' };
 
 export interface IndexerTask {
   readonly result: Promise<IndexOutcome>;
   cancel(): void;
+}
+
+export interface IndexerOptions {
+  chunkSize?: number;
+  maxAnchors?: number;
 }
 
 export class IndexerError extends Error {
@@ -28,13 +33,13 @@ export class WorkerPool {
   constructor(private readonly distDir: string) {}
 
   /**
-   * Indexes `filePath` in a worker, appending line starts to `index` as they arrive.
+   * Indexes `filePath` in a worker, appending anchors to `index` as they arrive.
    * `onProgress` is called after every update with the file size seen by the worker.
    */
-  index(filePath: string, index: LineIndex, onProgress: (fileSize: number) => void): IndexerTask {
+  index(filePath: string, index: LineIndex, onProgress: (fileSize: number) => void, opts: IndexerOptions = {}): IndexerTask {
     const cancelBuf = new SharedArrayBuffer(4);
     const cancelFlag = new Int32Array(cancelBuf);
-    const workerData: IndexerWorkerData = { filePath, cancel: cancelBuf };
+    const workerData: IndexerWorkerData = { filePath, cancel: cancelBuf, ...opts };
     const worker = new Worker(path.join(this.distDir, 'indexer.worker.js'), { workerData });
 
     let settled = false;
@@ -51,23 +56,28 @@ export class WorkerPool {
 
       worker.on('message', (msg: IndexerMessage) => {
         if (settled) return;
-        switch (msg.type) {
-          case 'progress':
-            index.append(msg.starts, msg.bytesIndexed);
-            onProgress(msg.fileSize);
-            break;
-          case 'done':
-            index.append(msg.starts, msg.fileSize);
-            index.complete(msg.fileSize);
-            finish(() => resolve({ status: 'done', fileSize: msg.fileSize, elapsedMs: msg.elapsedMs }));
-            onProgress(msg.fileSize);
-            break;
-          case 'cancelled':
-            finish(() => resolve({ status: 'cancelled' }));
-            break;
-          case 'error':
-            finish(() => reject(new IndexerError(msg.message, msg.code)));
-            break;
+        try {
+          switch (msg.type) {
+            case 'progress':
+              index.append(msg.anchors, msg);
+              onProgress(msg.fileSize);
+              break;
+            case 'done':
+              index.append(msg.anchors, { stride: msg.stride, linesStarted: msg.linesStarted, bytesIndexed: msg.fileSize });
+              index.complete(msg.fileSize, msg.lineCount);
+              finish(() => resolve({ status: 'done', fileSize: msg.fileSize, mtimeMs: msg.mtimeMs, elapsedMs: msg.elapsedMs }));
+              onProgress(msg.fileSize);
+              break;
+            case 'cancelled':
+              finish(() => resolve({ status: 'cancelled' }));
+              break;
+            case 'error':
+              finish(() => reject(new IndexerError(msg.message, msg.code)));
+              break;
+          }
+        } catch (err) {
+          finish(() => reject(err));
+          void worker.terminate();
         }
       });
       worker.on('error', (err) => finish(() => reject(err)));

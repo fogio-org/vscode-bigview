@@ -29,9 +29,27 @@
         "command": "bigview.openFile",
         "title": "Open File in BigView",
         "category": "BigView"
+      },
+      {
+        "command": "bigview.goToLine",
+        "title": "Go to Line...",
+        "category": "BigView"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "bigview.goToLine",
+        "key": "ctrl+g",
+        "when": "activeCustomEditorId == 'bigview.viewer'"
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "bigview.goToLine",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        }
+      ],
       "explorer/context": [
         {
           "command": "bigview.openFile",

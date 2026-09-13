@@ -58,8 +58,10 @@ export class VirtualList {
   private readonly hbar: HTMLDivElement;
   private readonly hthumb: HTMLDivElement;
   private readonly rows: Row[] = [];
+  private readonly highlight: HTMLDivElement;
 
   private lineCount = 0;
+  private highlightLine = -1;
   private virtualTop = 0;
   private scrollLeft = 0;
   private viewWidth = 0;
@@ -82,7 +84,9 @@ export class VirtualList {
     this.textLayer = el('div', 'vl-layer');
     gutter.append(this.gutterLayer);
     text.append(this.textLayer);
-    this.view.append(gutter, text);
+    this.highlight = el('div', 'vl-highlight');
+    this.highlight.hidden = true;
+    this.view.append(this.highlight, gutter, text);
 
     this.vbar = el('div', 'vl-scrollbar vl-vbar');
     this.vthumb = el('div', 'vl-thumb');
@@ -127,6 +131,24 @@ export class VirtualList {
 
   scrollToLine(line: number): void {
     this.setScrollTop(line * this.lineHeight);
+  }
+
+  get visibleLines(): number {
+    return Math.max(1, Math.floor(this.viewHeight / this.lineHeight));
+  }
+
+  /** Scrolls `line` to about a third of the viewport and highlights it. Always reports the viewport. */
+  revealLine(line: number): void {
+    const target = clamp(Math.floor(line), 0, Math.max(0, this.lineCount - 1));
+    this.highlightLine = target;
+    const above = Math.floor(this.visibleLines / 3);
+    this.virtualTop = clamp((target - above) * this.lineHeight, 0, this.maxScrollTop);
+    this.schedule();
+    this.opts.onScroll?.(this.topLine);
+  }
+
+  focus(): void {
+    this.view.focus({ preventScroll: true });
   }
 
   // ---- geometry ----
@@ -340,6 +362,11 @@ export class VirtualList {
     const offsetY = start * lh - this.virtualTop;
     this.gutterLayer.style.transform = `translate3d(0, ${offsetY}px, 0)`;
     this.textLayer.style.transform = `translate3d(${-this.scrollLeft}px, ${offsetY}px, 0)`;
+
+    const hy = this.highlightLine * lh - this.virtualTop;
+    const showHighlight = this.highlightLine >= 0 && this.highlightLine < this.lineCount && hy > -lh && hy < this.viewHeight;
+    this.highlight.hidden = !showHighlight;
+    if (showHighlight) this.highlight.style.transform = `translate3d(0, ${hy}px, 0)`;
 
     const vg = this.thumb('v');
     this.vthumb.hidden = !vg;

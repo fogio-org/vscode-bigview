@@ -8,18 +8,29 @@ import { generateFixture, type GenerateOptions, type GenerateResult } from '../f
 
 const MB = 1024 * 1024;
 
+/** default: always; large: BIGVIEW_LARGE=1; huge: BIGVIEW_HUGE=1 */
+export type FixtureTier = 'default' | 'large' | 'huge';
+
 export interface FixtureSpec {
   name: string;
-  large: boolean;
+  tier: FixtureTier;
   opts: Omit<GenerateOptions, 'path'>;
 }
 
 export const FIXTURES = {
-  small: { name: 'it-10m.log', large: false, opts: { sizeBytes: 10 * MB, format: 'log', unicode: true, seed: 7 } },
-  tiny: { name: 'it-default.log', large: false, opts: { sizeBytes: 1 * MB, format: 'log', seed: 3 } },
-  m200: { name: 'it-200m.log', large: true, opts: { sizeBytes: 200 * MB, format: 'log', avgLineLength: 200, seed: 11 } },
-  g1: { name: 'it-1g.log', large: true, opts: { sizeBytes: 1024 * MB, format: 'log', avgLineLength: 200, seed: 11 } },
+  small: { name: 'it-10m.log', tier: 'default', opts: { sizeBytes: 10 * MB, format: 'log', unicode: true, seed: 7 } },
+  tiny: { name: 'it-default.log', tier: 'default', opts: { sizeBytes: 1 * MB, format: 'log', seed: 3 } },
+  m200: { name: 'it-200m.log', tier: 'large', opts: { sizeBytes: 200 * MB, format: 'log', avgLineLength: 200, seed: 11 } },
+  g1: { name: 'it-1g.log', tier: 'large', opts: { sizeBytes: 1024 * MB, format: 'log', avgLineLength: 200, seed: 11 } },
+  g5: { name: 'it-5g.log', tier: 'huge', opts: { sizeBytes: 5 * 1024 * MB, format: 'log', avgLineLength: 200, seed: 13 } },
 } satisfies Record<string, FixtureSpec>;
+
+export function enabledTiers(env: NodeJS.ProcessEnv): Set<FixtureTier> {
+  const tiers = new Set<FixtureTier>(['default']);
+  if (env.BIGVIEW_LARGE) tiers.add('large');
+  if (env.BIGVIEW_HUGE) tiers.add('huge');
+  return tiers;
+}
 
 function paths(root: string, spec: FixtureSpec): { file: string; meta: string } {
   const file = path.join(root, 'test', '.tmp', spec.name);

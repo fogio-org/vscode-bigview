@@ -1,3 +1,4 @@
+import { formatBytes, formatCount } from '../src/shared/format';
 import type { HostToWebview, WebviewToHost } from '../src/shared/protocol';
 import './styles.css';
 import { VirtualList, type LineEntry } from './VirtualList';
@@ -17,6 +18,7 @@ interface SavedState {
 const BLOCK = 200;
 const MAX_CACHED_LINES = 20_000;
 const REQUEST_RETRY_MS = 10_000;
+const VIEWPORT_POST_MS = 100;
 
 const vscode = acquireVsCodeApi();
 const cache = new Map<number, LineEntry>();
@@ -25,6 +27,7 @@ const pendingBlocks = new Map<number, number>();
 let reqSeq = 0;
 let lineCount = 0;
 let restoreLine = (vscode.getState() as SavedState | undefined)?.topLine ?? 0;
+let viewportTimer = 0;
 
 const $ = (id: string): HTMLElement => document.getElementById(id) as HTMLElement;
 const fileNameEl = $('file-name');
@@ -38,11 +41,22 @@ const list = new VirtualList({
   container: $('viewport'),
   getLine: (line) => cache.get(line),
   ensureRange,
-  onScroll: (topLine) => vscode.setState({ topLine } satisfies SavedState),
+  onScroll: (topLine) => {
+    vscode.setState({ topLine } satisfies SavedState);
+    scheduleViewport();
+  },
 });
 
 function post(msg: WebviewToHost): void {
   vscode.postMessage(msg);
+}
+
+function scheduleViewport(): void {
+  if (viewportTimer !== 0) return;
+  viewportTimer = window.setTimeout(() => {
+    viewportTimer = 0;
+    post({ type: 'viewport', topLine: list.topLine, visibleLines: list.visibleLines });
+  }, VIEWPORT_POST_MS);
 }
 
 function blockLoaded(block: number): boolean {
@@ -72,16 +86,6 @@ function evict(): void {
   }
 }
 
-function formatBytes(n: number): string {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) {
-    n /= 1024;
-    i++;
-  }
-  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-}
-
 window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
   const msg = event.data;
   switch (msg.type) {
@@ -93,8 +97,10 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       lineCount = msg.lineCount;
       list.setLineCount(msg.lineCount);
       const pct = msg.fileSize > 0 ? Math.floor((msg.bytesIndexed / msg.fileSize) * 100) : 100;
-      const lines = `${msg.lineCount.toLocaleString()} lines`;
-      statusEl.textContent = msg.done ? lines : `Indexing… ${pct}% · ${lines}`;
+      const lines = `${formatCount(msg.lineCount)} lines`;
+      statusEl.textContent = msg.done
+        ? `${lines} · ${msg.source === 'cache' ? 'index loaded from cache' : 'indexed'}`
+        : `Indexing… ${pct}% · ${lines}`;
       progressBarEl.style.width = `${pct}%`;
       progressEl.classList.toggle('done', msg.done);
       if (restoreLine > 0 && (msg.lineCount > restoreLine || msg.done)) {
@@ -111,6 +117,11 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       list.invalidate();
       break;
     }
+    case 'reveal':
+      restoreLine = 0;
+      list.revealLine(msg.line);
+      list.focus();
+      break;
     case 'error':
       errorEl.textContent = msg.message;
       errorEl.hidden = false;

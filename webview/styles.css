@@ -144,6 +144,23 @@ body {
   color: var(--vscode-descriptionForeground);
 }
 
+.vl-highlight {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--vl-line-height, 20px);
+  box-sizing: border-box;
+  background: var(--vscode-editor-lineHighlightBackground);
+  border: 1px solid var(--vscode-editor-lineHighlightBorder, transparent);
+  pointer-events: none;
+  will-change: transform;
+}
+
+.vl-highlight[hidden] {
+  display: none;
+}
+
 .vl-probe {
   position: absolute;
   visibility: hidden;
