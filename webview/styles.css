@@ -73,29 +73,26 @@ body {
 .vl {
   position: absolute;
   inset: 0;
+  overflow: hidden;
   font-family: var(--vscode-editor-font-family);
   font-size: var(--vscode-editor-font-size);
   font-weight: var(--vscode-editor-font-weight);
   line-height: var(--vl-line-height, 20px);
 }
 
-.vl-scroller {
-  position: absolute;
-  inset: 0;
-  overflow: auto;
-}
-
-.vl-spacer {
-  width: 1px;
-  height: 0;
-}
-
-.vl-overlay {
+.vl-view {
   position: absolute;
   top: 0;
   left: 0;
+  right: 14px;
+  bottom: 0;
   overflow: hidden;
   outline: none;
+}
+
+.vl-has-hbar .vl-view,
+.vl-has-hbar .vl-vbar {
+  bottom: 14px;
 }
 
 .vl-gutter {
@@ -151,4 +148,57 @@ body {
   position: absolute;
   visibility: hidden;
   white-space: pre;
+}
+
+/* ---- Virtual scrollbars ---- */
+
+.vl-scrollbar {
+  position: absolute;
+  touch-action: none;
+  user-select: none;
+}
+
+.vl-scrollbar[hidden],
+.vl-thumb[hidden] {
+  display: none;
+}
+
+.vl-vbar {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  border-left: 1px solid var(--vscode-editorOverviewRuler-border, transparent);
+  box-sizing: border-box;
+}
+
+.vl-hbar {
+  left: 0;
+  right: 14px;
+  bottom: 0;
+  height: 14px;
+}
+
+.vl-thumb {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: var(--vscode-scrollbarSlider-background);
+  will-change: transform;
+}
+
+.vl-vbar .vl-thumb {
+  right: 0;
+}
+
+.vl-hbar .vl-thumb {
+  bottom: 0;
+}
+
+.vl-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground);
+}
+
+.vl-thumb.active {
+  background: var(--vscode-scrollbarSlider-activeBackground);
 }

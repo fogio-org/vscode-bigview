@@ -1,15 +1,17 @@
 /**
- * Virtualized line list with a virtual scrollbar (SPEC §3.5, §7.6).
+ * Virtualized line list with fully virtual scrollbars (SPEC §3.5, §7.6).
  *
- * The native scroller only provides a scrollbar: its spacer is capped at MAX_SCROLL_HEIGHT
- * because Chromium clamps element heights (~33M px). The logical scroll position
- * (`virtualTop`, in unscaled pixels) is mapped to the scrollbar with a ratio. Wheel and
- * keyboard input move `virtualTop` directly, so fine scrolling stays exact on files of any
- * length; dragging the scrollbar maps back through the same ratio.
+ * There is no native scroll container at all:
+ * - Chromium clamps element heights (~33M px), so a spacer of `lineCount * lineHeight`
+ *   cannot work for big files;
+ * - VS Code webviews on macOS use overlay scrollbars (zero width), which cannot be grabbed
+ *   when content is drawn over them.
  *
- * Rows are drawn in an overlay that is never taller than the viewport, so no element ever
- * gets a huge offset.
+ * The logical position (`virtualTop`, unscaled px) is changed by wheel, keyboard and our own
+ * scrollbar thumbs. Only visible rows plus a buffer are in the DOM, and they are offset by at
+ * most a few hundred pixels, so no element ever gets huge coordinates.
  */
+import { clamp, positionForThumbOffset, thumbGeometry, type ThumbGeometry } from './scrollMath';
 
 export interface LineEntry {
   text: string;
@@ -25,9 +27,11 @@ export interface VirtualListOptions {
 }
 
 const BUFFER_LINES = 50;
-const MAX_SCROLL_HEIGHT = 1_000_000;
+const SCROLLBAR_PX = 14;
 const TEXT_PADDING_PX = 12;
 const GUTTER_PADDING_PX = 28;
+
+type Axis = 'v' | 'h';
 
 interface Row {
   gutter: HTMLDivElement;
@@ -37,53 +41,68 @@ interface Row {
   truncated: boolean;
 }
 
+interface Drag {
+  axis: Axis;
+  pointerId: number;
+  startClient: number;
+  startOffset: number;
+}
+
 export class VirtualList {
   private readonly root: HTMLDivElement;
-  private readonly scroller: HTMLDivElement;
-  private readonly spacer: HTMLDivElement;
-  private readonly overlay: HTMLDivElement;
+  private readonly view: HTMLDivElement;
   private readonly gutterLayer: HTMLDivElement;
   private readonly textLayer: HTMLDivElement;
+  private readonly vbar: HTMLDivElement;
+  private readonly vthumb: HTMLDivElement;
+  private readonly hbar: HTMLDivElement;
+  private readonly hthumb: HTMLDivElement;
   private readonly rows: Row[] = [];
 
   private lineCount = 0;
   private virtualTop = 0;
   private scrollLeft = 0;
-  private lastScrollTop = 0;
   private viewWidth = 0;
   private viewHeight = 0;
   private lineHeight = 20;
   private charWidth = 8;
   private gutterDigits = 0;
   private maxLineChars = 0;
+  private hbarVisible = false;
+  private drag: Drag | undefined;
   private frame = 0;
 
   constructor(private readonly opts: VirtualListOptions) {
     this.root = el('div', 'vl');
-    this.scroller = el('div', 'vl-scroller');
-    this.scroller.tabIndex = -1;
-    this.spacer = el('div', 'vl-spacer');
-    this.overlay = el('div', 'vl-overlay');
-    this.overlay.tabIndex = 0;
+    this.view = el('div', 'vl-view');
+    this.view.tabIndex = 0;
     const gutter = el('div', 'vl-gutter');
     const text = el('div', 'vl-text');
     this.gutterLayer = el('div', 'vl-layer');
     this.textLayer = el('div', 'vl-layer');
-
-    this.scroller.append(this.spacer);
     gutter.append(this.gutterLayer);
     text.append(this.textLayer);
-    this.overlay.append(gutter, text);
-    this.root.append(this.scroller, this.overlay);
+    this.view.append(gutter, text);
+
+    this.vbar = el('div', 'vl-scrollbar vl-vbar');
+    this.vthumb = el('div', 'vl-thumb');
+    this.vbar.append(this.vthumb);
+    this.hbar = el('div', 'vl-scrollbar vl-hbar');
+    this.hthumb = el('div', 'vl-thumb');
+    this.hbar.append(this.hthumb);
+    this.hbar.hidden = true;
+
+    this.root.append(this.view, this.vbar, this.hbar);
     opts.container.append(this.root);
 
     this.measureFont();
     this.root.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
-    this.scroller.addEventListener('scroll', () => this.onNativeScroll());
-    this.overlay.addEventListener('keydown', (e) => this.onKey(e));
+    this.view.addEventListener('keydown', (e) => this.onKey(e));
+    this.bindScrollbar(this.vbar, this.vthumb, 'v');
+    this.bindScrollbar(this.hbar, this.hthumb, 'h');
     new ResizeObserver(() => this.layout()).observe(this.root);
     this.layout();
-    this.overlay.focus();
+    this.view.focus();
   }
 
   get topLine(): number {
@@ -98,9 +117,7 @@ export class VirtualList {
       this.gutterDigits = digits;
       this.root.style.setProperty('--vl-gutter-width', `${this.gutterWidth}px`);
     }
-    this.updateSpacer();
-    this.syncScrollbar();
-    this.schedule();
+    this.layout();
   }
 
   /** Call when line data changed (e.g. a batch arrived). */
@@ -109,8 +126,10 @@ export class VirtualList {
   }
 
   scrollToLine(line: number): void {
-    this.setVirtualTop(line * this.lineHeight);
+    this.setScrollTop(line * this.lineHeight);
   }
+
+  // ---- geometry ----
 
   private get gutterWidth(): number {
     return Math.ceil(this.gutterDigits * this.charWidth) + GUTTER_PADDING_PX;
@@ -120,12 +139,26 @@ export class VirtualList {
     return this.lineCount * this.lineHeight;
   }
 
-  private get maxVirtualTop(): number {
+  private get maxScrollTop(): number {
     return Math.max(0, this.totalHeight - this.viewHeight);
   }
 
-  private get maxScrollTop(): number {
-    return Math.max(0, Math.min(this.totalHeight, MAX_SCROLL_HEIGHT) - this.viewHeight);
+  private get textViewWidth(): number {
+    return Math.max(0, this.viewWidth - this.gutterWidth);
+  }
+
+  private get contentWidth(): number {
+    return Math.ceil(this.maxLineChars * this.charWidth) + TEXT_PADDING_PX * 2;
+  }
+
+  private get maxScrollLeft(): number {
+    return Math.max(0, this.contentWidth - this.textViewWidth);
+  }
+
+  private thumb(axis: Axis): ThumbGeometry | undefined {
+    return axis === 'v'
+      ? thumbGeometry(this.totalHeight, this.viewHeight, this.virtualTop, this.viewHeight)
+      : thumbGeometry(this.contentWidth, this.textViewWidth, this.scrollLeft, this.viewWidth);
   }
 
   private measureFont(): void {
@@ -141,50 +174,85 @@ export class VirtualList {
   }
 
   private layout(): void {
-    this.viewWidth = this.scroller.clientWidth;
-    this.viewHeight = this.scroller.clientHeight;
-    this.overlay.style.width = `${this.viewWidth}px`;
-    this.overlay.style.height = `${this.viewHeight}px`;
-    this.setVirtualTop(this.virtualTop, false);
-  }
-
-  private updateSpacer(): void {
-    // Integers only: template literals turn 1e6 into "1e+06px".
-    const height = Math.round(Math.min(this.totalHeight, MAX_SCROLL_HEIGHT));
-    const width = Math.ceil(this.gutterWidth + TEXT_PADDING_PX * 2 + this.maxLineChars * this.charWidth);
-    this.spacer.style.height = `${height.toFixed(0)}px`;
-    this.spacer.style.width = `${width.toFixed(0)}px`;
-  }
-
-  private setVirtualTop(top: number, notify = true): void {
-    const clamped = Math.min(Math.max(0, top), this.maxVirtualTop);
-    const changed = clamped !== this.virtualTop;
-    this.virtualTop = clamped;
-    this.syncScrollbar();
-    this.schedule();
-    if (changed && notify) this.opts.onScroll?.(this.topLine);
-  }
-
-  /** Moves the native scrollbar thumb to reflect `virtualTop`. */
-  private syncScrollbar(): void {
-    const maxVirtual = this.maxVirtualTop;
-    const target = maxVirtual > 0 ? (this.virtualTop * this.maxScrollTop) / maxVirtual : 0;
-    this.scroller.scrollTop = target;
-    this.lastScrollTop = this.scroller.scrollTop;
-  }
-
-  private onNativeScroll(): void {
-    const st = this.scroller.scrollTop;
-    // Ignore echoes of our own syncScrollbar(); anything else is a scrollbar drag/click.
-    if (Math.abs(st - this.lastScrollTop) >= 1) {
-      this.lastScrollTop = st;
-      const maxScroll = this.maxScrollTop;
-      const top = maxScroll <= 0 ? 0 : st >= maxScroll - 0.5 ? this.maxVirtualTop : (st * this.maxVirtualTop) / maxScroll;
-      this.virtualTop = top;
-      this.opts.onScroll?.(this.topLine);
+    this.viewWidth = Math.max(0, this.root.clientWidth - SCROLLBAR_PX);
+    const needHbar = this.contentWidth > this.textViewWidth;
+    if (needHbar !== this.hbarVisible) {
+      this.hbarVisible = needHbar;
+      this.hbar.hidden = !needHbar;
+      this.root.classList.toggle('vl-has-hbar', needHbar);
     }
-    if (this.scroller.scrollLeft !== this.scrollLeft) this.scrollLeft = this.scroller.scrollLeft;
+    this.viewHeight = Math.max(0, this.root.clientHeight - (needHbar ? SCROLLBAR_PX : 0));
+    this.virtualTop = clamp(this.virtualTop, 0, this.maxScrollTop);
+    this.scrollLeft = clamp(this.scrollLeft, 0, this.maxScrollLeft);
     this.schedule();
+  }
+
+  // ---- scrolling ----
+
+  private setScrollTop(top: number): void {
+    const next = clamp(top, 0, this.maxScrollTop);
+    if (next === this.virtualTop) return;
+    this.virtualTop = next;
+    this.schedule();
+    this.opts.onScroll?.(this.topLine);
+  }
+
+  private setScrollLeft(left: number): void {
+    const next = clamp(left, 0, this.maxScrollLeft);
+    if (next === this.scrollLeft) return;
+    this.scrollLeft = next;
+    this.schedule();
+  }
+
+  private applyThumbOffset(axis: Axis, offset: number): void {
+    if (axis === 'v') {
+      this.setScrollTop(positionForThumbOffset(this.totalHeight, this.viewHeight, offset, this.viewHeight));
+    } else {
+      this.setScrollLeft(positionForThumbOffset(this.contentWidth, this.textViewWidth, offset, this.viewWidth));
+    }
+  }
+
+  private bindScrollbar(bar: HTMLDivElement, thumb: HTMLDivElement, axis: Axis): void {
+    const coord = (e: PointerEvent): number => (axis === 'v' ? e.clientY : e.clientX);
+
+    bar.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      const geo = this.thumb(axis);
+      if (!geo) return;
+      e.preventDefault();
+      let startOffset = geo.offset;
+      if (e.target !== thumb) {
+        // Click on the track: jump so the thumb centers under the pointer, then keep dragging.
+        const rect = bar.getBoundingClientRect();
+        startOffset = coord(e) - (axis === 'v' ? rect.top : rect.left) - geo.size / 2;
+        this.applyThumbOffset(axis, startOffset);
+      }
+      this.drag = { axis, pointerId: e.pointerId, startClient: coord(e), startOffset };
+      bar.setPointerCapture(e.pointerId);
+      thumb.classList.add('active');
+      this.view.focus({ preventScroll: true });
+    });
+
+    const end = (e: PointerEvent): void => {
+      if (this.drag?.axis !== axis || this.drag.pointerId !== e.pointerId) return;
+      this.drag = undefined;
+      thumb.classList.remove('active');
+      if (bar.hasPointerCapture(e.pointerId)) bar.releasePointerCapture(e.pointerId);
+    };
+
+    bar.addEventListener('pointermove', (e) => {
+      const d = this.drag;
+      if (!d || d.axis !== axis || d.pointerId !== e.pointerId) return;
+      // The webview is an iframe: a release outside it may never reach us.
+      if ((e.buttons & 1) === 0) {
+        end(e);
+        return;
+      }
+      this.applyThumbOffset(axis, d.startOffset + coord(e) - d.startClient);
+    });
+    bar.addEventListener('pointerup', end);
+    bar.addEventListener('pointercancel', end);
+    bar.addEventListener('lostpointercapture', end);
   }
 
   private onWheel(e: WheelEvent): void {
@@ -197,26 +265,28 @@ export class VirtualList {
       dx = dy;
       dy = 0;
     }
-    if (dy !== 0) this.setVirtualTop(this.virtualTop + dy);
-    if (dx !== 0) this.scroller.scrollLeft += dx; // native scroll event updates scrollLeft
+    if (dy !== 0) this.setScrollTop(this.virtualTop + dy);
+    if (dx !== 0) this.setScrollLeft(this.scrollLeft + dx);
   }
 
   private onKey(e: KeyboardEvent): void {
     const page = Math.max(this.lineHeight, this.viewHeight - this.lineHeight);
     let handled = true;
     switch (e.key) {
-      case 'ArrowDown': this.setVirtualTop(this.virtualTop + this.lineHeight); break;
-      case 'ArrowUp': this.setVirtualTop(this.virtualTop - this.lineHeight); break;
-      case 'PageDown': this.setVirtualTop(this.virtualTop + page); break;
-      case 'PageUp': this.setVirtualTop(this.virtualTop - page); break;
-      case 'Home': this.setVirtualTop(0); break;
-      case 'End': this.setVirtualTop(this.maxVirtualTop); break;
-      case 'ArrowRight': this.scroller.scrollLeft += this.charWidth * 4; break;
-      case 'ArrowLeft': this.scroller.scrollLeft -= this.charWidth * 4; break;
+      case 'ArrowDown': this.setScrollTop(this.virtualTop + this.lineHeight); break;
+      case 'ArrowUp': this.setScrollTop(this.virtualTop - this.lineHeight); break;
+      case 'PageDown': this.setScrollTop(this.virtualTop + page); break;
+      case 'PageUp': this.setScrollTop(this.virtualTop - page); break;
+      case 'Home': this.setScrollTop(0); break;
+      case 'End': this.setScrollTop(this.maxScrollTop); break;
+      case 'ArrowRight': this.setScrollLeft(this.scrollLeft + this.charWidth * 4); break;
+      case 'ArrowLeft': this.setScrollLeft(this.scrollLeft - this.charWidth * 4); break;
       default: handled = false;
     }
     if (handled) e.preventDefault();
   }
+
+  // ---- rendering ----
 
   private schedule(): void {
     if (this.frame === 0) this.frame = requestAnimationFrame(() => this.render());
@@ -263,13 +333,26 @@ export class VirtualList {
     }
     if (widest !== this.maxLineChars) {
       this.maxLineChars = widest;
-      this.updateSpacer();
+      this.layout(); // may show the horizontal scrollbar; schedules another frame
     }
 
     // Offset is at most ~BUFFER_LINES rows: layers never get huge coordinates.
     const offsetY = start * lh - this.virtualTop;
     this.gutterLayer.style.transform = `translate3d(0, ${offsetY}px, 0)`;
     this.textLayer.style.transform = `translate3d(${-this.scrollLeft}px, ${offsetY}px, 0)`;
+
+    const vg = this.thumb('v');
+    this.vthumb.hidden = !vg;
+    if (vg) {
+      this.vthumb.style.height = `${vg.size}px`;
+      this.vthumb.style.transform = `translate3d(0, ${vg.offset}px, 0)`;
+    }
+    const hg = this.hbarVisible ? this.thumb('h') : undefined;
+    this.hthumb.hidden = !hg;
+    if (hg) {
+      this.hthumb.style.width = `${hg.size}px`;
+      this.hthumb.style.transform = `translate3d(${hg.offset}px, 0, 0)`;
+    }
   }
 
   private createRow(k: number): Row {
