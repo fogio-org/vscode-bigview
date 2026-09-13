@@ -1,0 +1,154 @@
+/* Only VS Code theme variables — no hardcoded colors. */
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+#header {
+  flex: none;
+  display: flex;
+  gap: 16px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#file-name {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
+#progress {
+  flex: none;
+  height: 2px;
+}
+
+#progress.done {
+  visibility: hidden;
+}
+
+#progress-bar {
+  height: 100%;
+  width: 0;
+  background: var(--vscode-progressBar-background);
+}
+
+#error {
+  flex: none;
+  padding: 6px 12px;
+  background: var(--vscode-inputValidation-errorBackground);
+  border-bottom: 1px solid var(--vscode-inputValidation-errorBorder);
+  color: var(--vscode-errorForeground);
+}
+
+#error[hidden] {
+  display: none;
+}
+
+#viewport {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+}
+
+/* ---- VirtualList ---- */
+
+.vl {
+  position: absolute;
+  inset: 0;
+  font-family: var(--vscode-editor-font-family);
+  font-size: var(--vscode-editor-font-size);
+  font-weight: var(--vscode-editor-font-weight);
+  line-height: var(--vl-line-height, 20px);
+}
+
+.vl-scroller {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+}
+
+.vl-spacer {
+  width: 1px;
+  height: 0;
+}
+
+.vl-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+  outline: none;
+}
+
+.vl-gutter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--vl-gutter-width, 48px);
+  overflow: hidden;
+  color: var(--vscode-editorLineNumber-foreground);
+  text-align: right;
+  user-select: none;
+}
+
+.vl-text {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--vl-gutter-width, 48px);
+  right: 0;
+  overflow: hidden;
+}
+
+.vl-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.vl-row {
+  position: absolute;
+  left: 0;
+  height: var(--vl-line-height, 20px);
+  white-space: pre;
+}
+
+.vl-gutter .vl-row {
+  right: 14px;
+}
+
+.vl-text .vl-row {
+  padding-left: 12px;
+}
+
+.vl-row.truncated::after {
+  content: ' … (line truncated)';
+  color: var(--vscode-descriptionForeground);
+}
+
+.vl-probe {
+  position: absolute;
+  visibility: hidden;
+  white-space: pre;
+}

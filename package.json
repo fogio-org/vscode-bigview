@@ -1,0 +1,72 @@
+{
+  "name": "bigview",
+  "displayName": "BigView",
+  "description": "View and search huge log, JSONL and CSV files without loading them into memory.",
+  "version": "0.0.1",
+  "publisher": "fogio",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./dist/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "bigview.viewer",
+        "displayName": "BigView",
+        "selector": [
+          { "filenamePattern": "*.log" },
+          { "filenamePattern": "*.jsonl" },
+          { "filenamePattern": "*.ndjson" },
+          { "filenamePattern": "*.csv" },
+          { "filenamePattern": "*.tsv" }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "bigview.openFile",
+        "title": "Open File in BigView",
+        "category": "BigView"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "bigview.openFile",
+          "when": "!explorerResourceIsFolder",
+          "group": "navigation@99"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "bigview.openFile",
+          "when": "resourceScheme == file",
+          "group": "navigation@99"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p . --noEmit && tsc -p webview --noEmit",
+    "lint": "eslint src webview test",
+    "test": "vitest run",
+    "test:integration": "npm run build && tsx test/integration/runTests.ts",
+    "fixtures": "tsx test/fixtures/generate.ts",
+    "bench": "npm run build && tsx test/bench/bench.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "@types/vscode": "~1.90.0",
+    "@vscode/test-electron": "^3.1.0",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.10.0",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^5.0.0"
+  }
+}

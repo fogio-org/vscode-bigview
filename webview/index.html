@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src {{cspSource}}; font-src {{cspSource}}; script-src 'nonce-{{nonce}}';"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="{{styleUri}}" />
+    <title>BigView</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="header">
+        <span id="file-name"></span>
+        <span id="file-info"></span>
+        <span id="index-status"></span>
+      </header>
+      <div id="progress"><div id="progress-bar"></div></div>
+      <div id="error" hidden></div>
+      <div id="viewport"></div>
+    </div>
+    <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+  </body>
+</html>
