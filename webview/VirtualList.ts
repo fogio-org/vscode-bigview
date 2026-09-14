@@ -1,32 +1,45 @@
 /**
- * Virtualized line list with fully virtual scrollbars (SPEC §3.5, §7.6).
+ * Virtualized list with fully virtual scrollbars (SPEC §3.5, §7.6). Used for the file lines and
+ * for the search results.
  *
  * There is no native scroll container at all:
- * - Chromium clamps element heights (~33M px), so a spacer of `lineCount * lineHeight`
- *   cannot work for big files;
- * - VS Code webviews on macOS use overlay scrollbars (zero width), which cannot be grabbed
- *   when content is drawn over them.
+ * - Chromium clamps element heights (~33M px), so a spacer of `count * rowHeight` cannot work
+ *   for big files;
+ * - VS Code webviews on macOS use overlay scrollbars (zero width), which cannot be grabbed when
+ *   content is drawn over them.
  *
  * The logical position (`virtualTop`, unscaled px) is changed by wheel, keyboard and our own
  * scrollbar thumbs. Only visible rows plus a buffer are in the DOM, and they are offset by at
  * most a few hundred pixels, so no element ever gets huge coordinates.
  */
+import type { Range } from '../src/shared/searchQuery';
 import { clamp, positionForThumbOffset, thumbGeometry, type ThumbGeometry } from './scrollMath';
 
-export interface LineEntry {
+export interface RowData {
   text: string;
-  truncated: boolean;
+  truncated?: boolean;
+  /** Highlighted ranges of `text` (UTF-16 offsets, ascending, non-overlapping). */
+  ranges?: readonly Range[];
+  /** Text was cut at the start: show an ellipsis. */
+  cutStart?: boolean;
 }
 
 export interface VirtualListOptions {
   container: HTMLElement;
-  getLine(line: number): LineEntry | undefined;
+  /** Row content, undefined while not loaded. A row re-renders when the returned object changes. */
+  getRow(index: number): RowData | undefined;
+  /** Gutter label; defaults to the 1-based row number. */
+  gutterText?(index: number): string;
   /** Called on every render with the buffered range [start, end) that should be loaded. */
   ensureRange(start: number, end: number): void;
-  onScroll?(topLine: number): void;
+  onScroll?(topRow: number): void;
+  onRowClick?(index: number): void;
+  className?: string;
+  /** Focus the list when created. Default true. */
+  autoFocus?: boolean;
 }
 
-const BUFFER_LINES = 50;
+const BUFFER_ROWS = 50;
 const SCROLLBAR_PX = 14;
 const TEXT_PADDING_PX = 12;
 const GUTTER_PADDING_PX = 28;
@@ -36,9 +49,9 @@ type Axis = 'v' | 'h';
 interface Row {
   gutter: HTMLDivElement;
   text: HTMLDivElement;
-  line: number;
-  content: string | undefined;
-  truncated: boolean;
+  index: number;
+  /** Data last rendered; null forces a re-render. */
+  data: RowData | undefined | null;
 }
 
 interface Drag {
@@ -57,17 +70,18 @@ export class VirtualList {
   private readonly vthumb: HTMLDivElement;
   private readonly hbar: HTMLDivElement;
   private readonly hthumb: HTMLDivElement;
-  private readonly rows: Row[] = [];
   private readonly highlight: HTMLDivElement;
+  private readonly rows: Row[] = [];
 
-  private lineCount = 0;
-  private highlightLine = -1;
+  private count = 0;
+  private highlightIndex = -1;
   private virtualTop = 0;
   private scrollLeft = 0;
   private viewWidth = 0;
   private viewHeight = 0;
   private lineHeight = 20;
   private charWidth = 8;
+  private measured = false;
   private gutterDigits = 0;
   private maxLineChars = 0;
   private hbarVisible = false;
@@ -75,7 +89,7 @@ export class VirtualList {
   private frame = 0;
 
   constructor(private readonly opts: VirtualListOptions) {
-    this.root = el('div', 'vl');
+    this.root = el('div', opts.className ? `vl ${opts.className}` : 'vl');
     this.view = el('div', 'vl-view');
     this.view.tabIndex = 0;
     const gutter = el('div', 'vl-gutter');
@@ -102,30 +116,46 @@ export class VirtualList {
     this.measureFont();
     this.root.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     this.view.addEventListener('keydown', (e) => this.onKey(e));
+    if (opts.onRowClick) this.view.addEventListener('click', (e) => this.onClick(e));
     this.bindScrollbar(this.vbar, this.vthumb, 'v');
     this.bindScrollbar(this.hbar, this.hthumb, 'h');
     new ResizeObserver(() => this.layout()).observe(this.root);
     this.layout();
-    this.view.focus();
+    if (opts.autoFocus ?? true) this.view.focus();
   }
 
   get topLine(): number {
     return Math.floor(this.virtualTop / this.lineHeight);
   }
 
-  setLineCount(count: number): void {
-    if (count === this.lineCount) return;
-    this.lineCount = count;
-    const digits = String(Math.max(1, count)).length;
-    if (digits !== this.gutterDigits) {
-      this.gutterDigits = digits;
-      this.root.style.setProperty('--vl-gutter-width', `${this.gutterWidth}px`);
-    }
+  get visibleLines(): number {
+    return Math.max(1, Math.floor(this.viewHeight / this.lineHeight));
+  }
+
+  setCount(count: number): void {
+    if (count === this.count) return;
+    this.count = count;
+    if (!this.opts.gutterText) this.setGutterMax(count);
     this.layout();
   }
 
-  /** Call when line data changed (e.g. a batch arrived). */
+  /** Sizes the gutter for labels up to `value`. */
+  setGutterMax(value: number): void {
+    const digits = String(Math.max(1, Math.floor(value))).length;
+    if (digits === this.gutterDigits) return;
+    this.gutterDigits = digits;
+    this.root.style.setProperty('--vl-gutter-width', `${this.gutterWidth}px`);
+    this.layout();
+  }
+
+  /** Call when row data changed (e.g. a batch arrived). */
   invalidate(): void {
+    this.schedule();
+  }
+
+  /** Re-renders all rows even if getRow() returns the same objects (e.g. highlights changed). */
+  refresh(): void {
+    for (const row of this.rows) row.data = null;
     this.schedule();
   }
 
@@ -133,18 +163,33 @@ export class VirtualList {
     this.setScrollTop(line * this.lineHeight);
   }
 
-  get visibleLines(): number {
-    return Math.max(1, Math.floor(this.viewHeight / this.lineHeight));
-  }
-
-  /** Scrolls `line` to about a third of the viewport and highlights it. Always reports the viewport. */
-  revealLine(line: number): void {
-    const target = clamp(Math.floor(line), 0, Math.max(0, this.lineCount - 1));
-    this.highlightLine = target;
-    const above = Math.floor(this.visibleLines / 3);
-    this.virtualTop = clamp((target - above) * this.lineHeight, 0, this.maxScrollTop);
+  /**
+   * Highlights `line` and scrolls it to about a third of the viewport (or only if it is not
+   * visible, with `onlyIfHidden`). Always reports the viewport through onScroll.
+   */
+  revealLine(line: number, onlyIfHidden = false): void {
+    const target = clamp(Math.floor(line), 0, Math.max(0, this.count - 1));
+    this.highlightIndex = target;
+    const y = target * this.lineHeight;
+    const visible = y >= this.virtualTop && y + this.lineHeight <= this.virtualTop + this.viewHeight;
+    if (!(onlyIfHidden && visible)) {
+      const above = Math.floor(this.visibleLines / 3);
+      this.virtualTop = clamp((target - above) * this.lineHeight, 0, this.maxScrollTop);
+    }
     this.schedule();
     this.opts.onScroll?.(this.topLine);
+  }
+
+  /** Scrolls the minimum needed to show row `index`. */
+  ensureVisible(index: number): void {
+    const y = index * this.lineHeight;
+    if (y < this.virtualTop) this.setScrollTop(y);
+    else if (y + this.lineHeight > this.virtualTop + this.viewHeight) this.setScrollTop(y + this.lineHeight - this.viewHeight);
+  }
+
+  setHighlight(index: number): void {
+    this.highlightIndex = index;
+    this.schedule();
   }
 
   focus(): void {
@@ -158,7 +203,7 @@ export class VirtualList {
   }
 
   private get totalHeight(): number {
-    return this.lineCount * this.lineHeight;
+    return this.count * this.lineHeight;
   }
 
   private get maxScrollTop(): number {
@@ -183,6 +228,7 @@ export class VirtualList {
       : thumbGeometry(this.contentWidth, this.textViewWidth, this.scrollLeft, this.viewWidth);
   }
 
+  /** Measures the monospace font; repeated once the list becomes visible if it was hidden. */
   private measureFont(): void {
     const probe = el('span', 'vl-probe');
     probe.textContent = 'X'.repeat(100);
@@ -190,12 +236,21 @@ export class VirtualList {
     const rect = probe.getBoundingClientRect();
     const fontSize = parseFloat(getComputedStyle(this.root).fontSize) || 13;
     probe.remove();
+    this.measured = rect.width > 0;
     this.charWidth = rect.width > 0 ? rect.width / 100 : fontSize * 0.6;
-    this.lineHeight = Math.max(Math.round(fontSize * 1.5), Math.ceil(rect.height), 12);
+    const lineHeight = Math.max(Math.round(fontSize * 1.5), Math.ceil(rect.height), 12);
+    if (lineHeight !== this.lineHeight) {
+      this.lineHeight = lineHeight;
+      this.rows.forEach((row, k) => {
+        row.gutter.style.top = row.text.style.top = `${k * lineHeight}px`;
+      });
+    }
     this.root.style.setProperty('--vl-line-height', `${this.lineHeight}px`);
+    if (this.gutterDigits > 0) this.root.style.setProperty('--vl-gutter-width', `${this.gutterWidth}px`);
   }
 
   private layout(): void {
+    if (!this.measured && this.root.clientWidth > 0) this.measureFont();
     this.viewWidth = Math.max(0, this.root.clientWidth - SCROLLBAR_PX);
     const needHbar = this.contentWidth > this.textViewWidth;
     if (needHbar !== this.hbarVisible) {
@@ -209,7 +264,7 @@ export class VirtualList {
     this.schedule();
   }
 
-  // ---- scrolling ----
+  // ---- input ----
 
   private setScrollTop(top: number): void {
     const next = clamp(top, 0, this.maxScrollTop);
@@ -308,6 +363,14 @@ export class VirtualList {
     if (handled) e.preventDefault();
   }
 
+  private onClick(e: MouseEvent): void {
+    const selection = document.getSelection();
+    if (selection && !selection.isCollapsed) return; // the user was selecting text
+    const rect = this.view.getBoundingClientRect();
+    const index = Math.floor((e.clientY - rect.top + this.virtualTop) / this.lineHeight);
+    if (index >= 0 && index < this.count) this.opts.onRowClick?.(index);
+  }
+
   // ---- rendering ----
 
   private schedule(): void {
@@ -319,8 +382,8 @@ export class VirtualList {
     const lh = this.lineHeight;
     const first = Math.floor(this.virtualTop / lh);
     const visible = Math.ceil(this.viewHeight / lh) + 1;
-    const start = Math.max(0, first - BUFFER_LINES);
-    const end = Math.min(this.lineCount, first + visible + BUFFER_LINES);
+    const start = Math.max(0, first - BUFFER_ROWS);
+    const end = Math.min(this.count, first + visible + BUFFER_ROWS);
     if (end > start) this.opts.ensureRange(start, end);
 
     const count = end - start;
@@ -330,27 +393,24 @@ export class VirtualList {
     for (let k = 0; k < this.rows.length; k++) {
       const row = this.rows[k] as Row;
       if (k >= count) {
-        if (row.line !== -1) {
+        if (row.index !== -1) {
           row.gutter.hidden = row.text.hidden = true;
-          row.line = -1;
+          row.index = -1;
         }
         continue;
       }
-      const line = start + k;
-      const entry = this.opts.getLine(line);
-      if (row.line !== line) {
-        row.gutter.textContent = String(line + 1);
+      const index = start + k;
+      const data = this.opts.getRow(index);
+      if (row.index !== index) {
         row.gutter.hidden = row.text.hidden = false;
-        row.line = line;
-        row.content = undefined;
+        row.index = index;
+        row.data = null;
       }
-      const content = entry?.text;
-      if (row.content !== content || row.truncated !== (entry?.truncated ?? false)) {
-        row.text.textContent = content ?? '';
-        row.content = content;
-        row.truncated = entry?.truncated ?? false;
-        row.text.classList.toggle('truncated', row.truncated);
-        if (content && content.length > widest) widest = content.length;
+      if (row.data !== data) {
+        row.gutter.textContent = this.opts.gutterText ? this.opts.gutterText(index) : String(index + 1);
+        renderText(row.text, data);
+        row.data = data;
+        if (data && data.text.length > widest) widest = data.text.length;
       }
     }
     if (widest !== this.maxLineChars) {
@@ -358,13 +418,13 @@ export class VirtualList {
       this.layout(); // may show the horizontal scrollbar; schedules another frame
     }
 
-    // Offset is at most ~BUFFER_LINES rows: layers never get huge coordinates.
+    // Offset is at most ~BUFFER_ROWS rows: layers never get huge coordinates.
     const offsetY = start * lh - this.virtualTop;
     this.gutterLayer.style.transform = `translate3d(0, ${offsetY}px, 0)`;
     this.textLayer.style.transform = `translate3d(${-this.scrollLeft}px, ${offsetY}px, 0)`;
 
-    const hy = this.highlightLine * lh - this.virtualTop;
-    const showHighlight = this.highlightLine >= 0 && this.highlightLine < this.lineCount && hy > -lh && hy < this.viewHeight;
+    const hy = this.highlightIndex * lh - this.virtualTop;
+    const showHighlight = this.highlightIndex >= 0 && this.highlightIndex < this.count && hy > -lh && hy < this.viewHeight;
     this.highlight.hidden = !showHighlight;
     if (showHighlight) this.highlight.style.transform = `translate3d(0, ${hy}px, 0)`;
 
@@ -390,8 +450,29 @@ export class VirtualList {
     text.style.top = top;
     this.gutterLayer.append(gutter);
     this.textLayer.append(text);
-    return { gutter, text, line: -1, content: undefined, truncated: false };
+    return { gutter, text, index: -1, data: null };
   }
+}
+
+function renderText(node: HTMLDivElement, data: RowData | undefined): void {
+  const text = data?.text ?? '';
+  const ranges = data?.ranges;
+  node.textContent = data?.cutStart ? '…' : '';
+  if (!ranges || ranges.length === 0) {
+    node.append(text);
+  } else {
+    let pos = 0;
+    for (const [s, e] of ranges) {
+      if (s < pos || e <= s) continue;
+      if (s > pos) node.append(text.slice(pos, s));
+      const mark = el('span', 'vl-match');
+      mark.textContent = text.slice(s, e);
+      node.append(mark);
+      pos = e;
+    }
+    if (pos < text.length) node.append(text.slice(pos));
+  }
+  node.classList.toggle('truncated', data?.truncated ?? false);
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): HTMLElementTagNameMap[K] {

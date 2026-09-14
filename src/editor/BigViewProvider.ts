@@ -3,14 +3,16 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import htmlTemplate from '../../webview/index.html';
-import { ChunkReader } from '../core/ChunkReader';
+import { ChunkReader, type ChunkReaderOptions } from '../core/ChunkReader';
 import type { FileHandlePool } from '../core/FileHandlePool';
 import { restoreLineIndex, type IndexStore } from '../core/IndexStore';
 import { LineIndex } from '../core/LineIndex';
 import { FREE_FILE_SIZE_LIMIT, isPro } from '../license';
 import type { IndexSource, IndexState, StatusInfo } from '../shared/format';
-import { MAX_LINES_PER_MESSAGE, type HostToWebview, type WebviewToHost } from '../shared/protocol';
+import { MAX_LINES_PER_MESSAGE, type HostToWebview, type WebviewCommand, type WebviewToHost } from '../shared/protocol';
+import type { SearchQuery } from '../shared/searchQuery';
 import type { IndexOutcome, WorkerPool } from '../workers/workerPool';
+import { SearchController } from './SearchController';
 
 export interface DocumentDeps {
   pool: FileHandlePool;
@@ -107,6 +109,15 @@ export class BigViewDocument implements vscode.CustomDocument {
     };
   }
 
+  /** A separate reader (own read-ahead block) over the same index. */
+  createReader(opts: ChunkReaderOptions = {}): ChunkReader {
+    return new ChunkReader(this.deps.pool, this.uri.fsPath, this.index, opts);
+  }
+
+  createSearchWorker(): ReturnType<WorkerPool['createSearchWorker']> {
+    return this.deps.workers.createSearchWorker();
+  }
+
   dispose(): void {
     this.cancelIndexing();
     this.deps.pool.close(this.uri.fsPath);
@@ -140,8 +151,15 @@ export interface BigViewEditor {
   readonly topLine: number;
   readonly visibleLines: number;
   readonly onDidChangeViewport: vscode.Event<void>;
+  readonly search: SearchController;
   /** Scrolls to and highlights a 0-based line. */
   reveal(line: number): void;
+  /** Forwards a keybinding command (find, find next/previous) to the webview. */
+  runCommand(command: WebviewCommand): void;
+  /** Types `query` into the webview search bar and runs it. */
+  setQuery(query: SearchQuery): void;
+  /** Handles a message as if it came from the webview (also used by integration tests). */
+  dispatch(msg: WebviewToHost): void;
 }
 
 export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigViewDocument>, vscode.Disposable {
@@ -202,9 +220,12 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
     };
 
     const viewportEmitter = new vscode.EventEmitter<void>();
+    const search = new SearchController(doc, () => doc.createSearchWorker(), post);
+
     const editor = {
       doc,
       panel,
+      search,
       topLine: 0,
       visibleLines: 0,
       onDidChangeViewport: viewportEmitter.event,
@@ -212,20 +233,13 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
         if (ready) post({ type: 'reveal', line });
         else pendingReveal = line;
       },
-    };
-    this.editors.add(editor);
-
-    const subscriptions: vscode.Disposable[] = [
-      viewportEmitter,
-      doc.onDidChange(postState),
-      panel.onDidChangeViewState(() => {
-        if (panel.active) this.setActive(editor);
-        else if (this.activeEditor === editor) this.setActive(undefined);
-      }),
-      webview.onDidReceiveMessage((msg: WebviewToHost) => {
+      runCommand: (command: WebviewCommand) => post({ type: 'command', command }),
+      setQuery: (query: SearchQuery) => post({ type: 'setQuery', query }),
+      dispatch: (msg: WebviewToHost) => {
         switch (msg.type) {
           case 'ready':
             ready = true; // (re)sent whenever the webview (re)loads
+            search.reset();
             post({ type: 'init', fileName: path.basename(doc.uri.fsPath), fileSize: doc.fileSize });
             postState();
             if (pendingReveal !== undefined) post({ type: 'reveal', line: pendingReveal });
@@ -247,8 +261,29 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
             editor.visibleLines = msg.visibleLines;
             viewportEmitter.fire();
             break;
+          case 'search':
+            search.start(msg.searchId, msg.query);
+            break;
+          case 'getResults':
+            search.sendResults(msg.searchId, msg.reqId, msg.start, msg.count);
+            break;
+          case 'gotoHit':
+            search.gotoHit(msg.searchId, msg.target);
+            break;
         }
+      },
+    };
+    this.editors.add(editor);
+
+    const subscriptions: vscode.Disposable[] = [
+      viewportEmitter,
+      search,
+      doc.onDidChange(postState),
+      panel.onDidChangeViewState(() => {
+        if (panel.active) this.setActive(editor);
+        else if (this.activeEditor === editor) this.setActive(undefined);
       }),
+      webview.onDidReceiveMessage((msg: WebviewToHost) => editor.dispatch(msg)),
     ];
     if (panel.active) this.setActive(editor);
 

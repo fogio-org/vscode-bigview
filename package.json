@@ -34,6 +34,21 @@
         "command": "bigview.goToLine",
         "title": "Go to Line...",
         "category": "BigView"
+      },
+      {
+        "command": "bigview.find",
+        "title": "Find in File",
+        "category": "BigView"
+      },
+      {
+        "command": "bigview.findNext",
+        "title": "Find Next",
+        "category": "BigView"
+      },
+      {
+        "command": "bigview.findPrevious",
+        "title": "Find Previous",
+        "category": "BigView"
       }
     ],
     "keybindings": [
@@ -41,12 +56,52 @@
         "command": "bigview.goToLine",
         "key": "ctrl+g",
         "when": "activeCustomEditorId == 'bigview.viewer'"
+      },
+      {
+        "command": "bigview.find",
+        "key": "ctrl+f",
+        "mac": "cmd+f",
+        "when": "activeCustomEditorId == 'bigview.viewer'"
+      },
+      {
+        "command": "bigview.findNext",
+        "key": "f3",
+        "when": "activeCustomEditorId == 'bigview.viewer'"
+      },
+      {
+        "command": "bigview.findPrevious",
+        "key": "shift+f3",
+        "when": "activeCustomEditorId == 'bigview.viewer'"
+      },
+      {
+        "command": "bigview.findNext",
+        "key": "f3",
+        "mac": "cmd+g",
+        "when": "activeCustomEditorId == 'bigview.viewer'"
+      },
+      {
+        "command": "bigview.findPrevious",
+        "key": "shift+f3",
+        "mac": "shift+cmd+g",
+        "when": "activeCustomEditorId == 'bigview.viewer'"
       }
     ],
     "menus": {
       "commandPalette": [
         {
           "command": "bigview.goToLine",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        },
+        {
+          "command": "bigview.find",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        },
+        {
+          "command": "bigview.findNext",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        },
+        {
+          "command": "bigview.findPrevious",
           "when": "activeCustomEditorId == 'bigview.viewer'"
         }
       ],

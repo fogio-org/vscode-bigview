@@ -6,8 +6,11 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as vscode from 'vscode';
 import type { BigViewDocument, BigViewEditor } from '../../src/editor/BigViewProvider';
+import type { SearchState } from '../../src/editor/SearchController';
 import type { BigViewApi } from '../../src/extension';
 import { formatCount } from '../../src/shared/format';
+import type { HitTarget } from '../../src/shared/protocol';
+import { compileQuery, type SearchQuery } from '../../src/shared/searchQuery';
 import type { GenerateResult } from '../fixtures/generate';
 import { enabledTiers, FIXTURES, loadFixture, type FixtureSpec } from './fixtures';
 
@@ -241,6 +244,132 @@ test('status bar shows size, line count and index state', async () => {
   assert.equal(statusBar.text, '');
 });
 
+// ---------------------------------------------------------------------------
+// Search (M3)
+
+type QueryInput = Partial<SearchQuery> & { text: string };
+
+const sameQuery = (a: SearchQuery | undefined, b: SearchQuery): boolean =>
+  !!a && a.text === b.text && a.caseSensitive === b.caseSensitive && a.wholeWord === b.wholeWord && a.regex === b.regex;
+
+/** Types the query into the webview search bar (real webview path) and waits for the result. */
+async function runSearch(editor: BigViewEditor, input: QueryInput, timeoutMs = 30_000): Promise<{ state: SearchState; ms: number }> {
+  const query: SearchQuery = { caseSensitive: true, wholeWord: false, regex: false, ...input };
+  const before = editor.search.state.searchId;
+  const t0 = performance.now();
+  editor.setQuery(query);
+  const state = await waitFor(
+    () => {
+      const s = editor.search.state;
+      return s.searchId !== before && sameQuery(s.query, query) && (s.status === 'done' || s.status === 'error') ? s : undefined;
+    },
+    timeoutMs,
+    `search ${JSON.stringify(query)}`,
+  );
+  const ms = performance.now() - t0;
+  // The webview jumps to the first hit on its own; let that settle before navigating.
+  if (state.status === 'done' && state.stored > 0) {
+    await waitFor(() => editor.search.lastHit?.searchId === state.searchId || undefined, 5000, 'auto-jump to the first hit');
+  }
+  return { state, ms };
+}
+
+/** Sends what a click on a result row (or F3) sends and checks the main list shows the line. */
+async function gotoAndCheck(editor: BigViewEditor, searchId: number, target: HitTarget, index: number, line: number): Promise<void> {
+  editor.search.lastHit = undefined;
+  editor.dispatch({ type: 'gotoHit', searchId, target });
+  const hit = await waitFor(() => editor.search.lastHit, 5000, `hit for ${JSON.stringify(target)}`);
+  assert.deepEqual({ index: hit.index, line: hit.line }, { index, line });
+  await waitFor(
+    () => (editor.topLine <= line && line < editor.topLine + editor.visibleLines) || undefined,
+    5000,
+    `viewport showing line ${line} (top ${editor.topLine}, visible ${editor.visibleLines})`,
+  );
+}
+
+function fileLines(file: string): string[] {
+  const lines = fs.readFileSync(file, 'utf8').split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+}
+
+test('search finds exactly the marker lines; every result navigates the main list', async () => {
+  const gen = fixture(FIXTURES.small);
+  const { editor } = await open(gen);
+  const { state, ms } = await runSearch(editor, { text: 'NEEDLE_MARKER' });
+  console.log(`    ${state.total} hits in ${ms.toFixed(0)} ms`);
+  assert.equal(state.status, 'done');
+  assert.equal(state.total, gen.markerLines);
+  const expected = fileLines(gen.path).flatMap((t, i) => (t.includes('NEEDLE_MARKER') ? [i] : []));
+  const hits = editor.search.hitLines();
+  assert.deepEqual(hits, expected);
+
+  // Result rows as the webview receives them.
+  const items = await editor.search.readResults(state.searchId, 0, 200);
+  assert.equal(items?.length, expected.length);
+  items?.forEach((item, i) => {
+    assert.equal(item.line, expected[i]);
+    const [s, e] = item.ranges[0] ?? [0, 0];
+    assert.equal(item.text.slice(s, e), 'NEEDLE_MARKER');
+  });
+
+  for (let i = 0; i < hits.length; i++) await gotoAndCheck(editor, state.searchId, { index: i }, i, hits[i] as number);
+  const at = (i: number): number => hits[i] as number;
+  const last = hits.length - 1;
+  await gotoAndCheck(editor, state.searchId, { fromLine: at(5) + 1, direction: 1 }, 6, at(6));
+  await gotoAndCheck(editor, state.searchId, { fromLine: at(5), direction: -1 }, 4, at(4));
+  await gotoAndCheck(editor, state.searchId, { fromLine: at(last) + 1, direction: 1 }, 0, at(0));
+  await gotoAndCheck(editor, state.searchId, { index: -1 }, last, at(last));
+});
+
+test('regex, case-insensitive and whole-word searches match a per-line reference', async () => {
+  const gen = fixture(FIXTURES.small);
+  const { editor } = await open(gen);
+  const lines = fileLines(gen.path);
+  const queries: QueryInput[] = [
+    { text: 'needle_marker', caseSensitive: false },
+    { text: 'ERROR \\[worker-1[0-5]\\]', regex: true },
+    { text: 'запрос', wholeWord: true },
+    { text: '^2026-01-01T00:0[0-2]', regex: true },
+    { text: '(?<=WARN  \\[)worker-7', regex: true },
+    { text: 'retry$', regex: true },
+    { text: 'CAFÉ', caseSensitive: false },
+  ];
+  for (const input of queries) {
+    const { state, ms } = await runSearch(editor, input);
+    assert.equal(state.status, 'done', state.error);
+    const re = compileQuery(state.query as SearchQuery).regex;
+    const expected = lines.flatMap((t, i) => (re.test(t) ? [i] : []));
+    assert.deepEqual(editor.search.hitLines(), expected, JSON.stringify(input));
+    console.log(`    ${JSON.stringify(input)}: ${state.total} hits in ${ms.toFixed(0)} ms`);
+  }
+});
+
+test('a new query replaces the running search; an invalid regex reports an error', async () => {
+  const gen = fixture(FIXTURES.small);
+  const { editor } = await open(gen);
+  const seen: SearchState[] = [];
+  const sub = editor.search.onDidChange((s) => seen.push(s));
+  try {
+    editor.setQuery({ text: '\\w+\\s+\\w+\\s+\\w+\\s+NOPE', caseSensitive: true, wholeWord: false, regex: true });
+    const { state } = await runSearch(editor, { text: 'NEEDLE_MARKER' });
+    assert.equal(state.total, gen.markerLines);
+    const firstId = seen.find((s) => s.query?.text.endsWith('NOPE'))?.searchId;
+    assert.ok(firstId !== undefined, 'the first search started');
+    let lastOfFirst = -1;
+    seen.forEach((s, i) => {
+      if (s.searchId === firstId) lastOfFirst = i;
+    });
+    const firstOfSecond = seen.findIndex((s) => s.searchId === state.searchId);
+    assert.ok(lastOfFirst < firstOfSecond, 'no updates from the replaced search after the new one started');
+  } finally {
+    sub.dispose();
+  }
+  const bad = await runSearch(editor, { text: '(unclosed', regex: true });
+  assert.equal(bad.state.status, 'error');
+  assert.match(bad.state.error ?? '', /Invalid regular expression/);
+});
+
 if (TIERS.has('large')) {
   for (const [label, spec] of [['200 MB', FIXTURES.m200], ['1 GB', FIXTURES.g1]] as const) {
     test(`opens a ${label} log: first page < ${FIRST_PAGE_BUDGET_MS} ms, index is exact`, async () => {
@@ -258,6 +387,40 @@ if (TIERS.has('large')) {
       assert.ok(firstPageMs < FIRST_PAGE_BUDGET_MS, `first page took ${firstPageMs} ms`);
     });
   }
+}
+
+if (TIERS.has('large')) {
+  test('M3 acceptance: 1 GB log with 137 marker lines — all found in < 6 s, every result navigates', async () => {
+    const gen = fixture(FIXTURES.g1);
+    assert.equal(gen.markerLines, 137);
+    const { doc, editor } = await open(gen);
+    const rss = new RssSampler();
+    const { state, ms } = await runSearch(editor, { text: 'NEEDLE_MARKER' }, 60_000);
+    const peak = rss.stop();
+    console.log(`    literal: ${state.total} hits in ${ms.toFixed(0)} ms, peak RSS ${mb(peak)}`);
+    assert.equal(state.status, 'done', state.error);
+    assert.equal(state.total, 137);
+    assert.ok(ms < 6000, `search took ${ms} ms`);
+
+    const hits = editor.search.hitLines();
+    assert.equal(new Set(hits).size, 137);
+    for (const line of hits) {
+      const { lines } = await doc.reader.readLines(line, 1);
+      assert.ok(lines[0]?.includes('NEEDLE_MARKER'), `line ${line} does not contain the marker`);
+    }
+    for (let i = 0; i < hits.length; i++) await gotoAndCheck(editor, state.searchId, { index: i }, i, hits[i] as number);
+
+    const variants: QueryInput[] = [
+      { text: 'needle_marker', caseSensitive: false },
+      { text: 'NEEDLE_MARK(ER)', regex: true },
+      { text: 'NEEDLE_MARKER', wholeWord: true },
+    ];
+    for (const input of variants) {
+      const r = await runSearch(editor, input, 60_000);
+      console.log(`    ${JSON.stringify(input)}: ${r.state.total} hits in ${r.ms.toFixed(0)} ms`);
+      assert.equal(r.state.total, 137);
+    }
+  });
 }
 
 if (TIERS.has('huge')) {
@@ -282,7 +445,11 @@ if (TIERS.has('huge')) {
     const rssCache = new RssSampler();
     const cached = await open(gen);
     const cacheReadMs = await checkSampledLines(cached.doc, gen.lines);
+    const search = await runSearch(cached.editor, { text: 'NEEDLE_MARKER' }, 120_000);
     const peakCache = rssCache.stop();
+    console.log(`    search: ${search.state.total} hits in ${(search.ms / 1000).toFixed(1)} s`);
+    assert.equal(search.state.status, 'done', search.state.error);
+    assert.ok(search.ms < 30_000, `5 GB literal search took ${search.ms} ms`);
     console.log(
       `    cache: ready in ${cached.readyMs.toFixed(0)} ms, first page ${cached.firstPageMs.toFixed(0)} ms, ` +
         `peak RSS ${mb(peakCache)}, worst read ${cacheReadMs.toFixed(1)} ms`,

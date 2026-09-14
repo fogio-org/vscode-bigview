@@ -14,7 +14,8 @@ import { ChunkReader } from '../../src/core/ChunkReader';
 import { FileHandlePool } from '../../src/core/FileHandlePool';
 import { IndexStore, restoreLineIndex } from '../../src/core/IndexStore';
 import { LineIndex } from '../../src/core/LineIndex';
-import { WorkerPool } from '../../src/workers/workerPool';
+import type { SearchQuery } from '../../src/shared/searchQuery';
+import { WorkerPool, type SearchWorker } from '../../src/workers/workerPool';
 import { parseSize, type GenerateResult } from '../fixtures/generate';
 
 const MB = 1024 * 1024;
@@ -37,7 +38,19 @@ async function main(): Promise<void> {
 
   const baselineRss = process.memoryUsage().rss;
   let peakRss = baselineRss;
-  const sampler = setInterval(() => (peakRss = Math.max(peakRss, process.memoryUsage().rss)), 10);
+  let phasePeak = baselineRss;
+  const phases: Array<[string, number, number]> = [];
+  const sampler = setInterval(() => {
+    const rss = process.memoryUsage().rss;
+    peakRss = Math.max(peakRss, rss);
+    phasePeak = Math.max(phasePeak, rss);
+  }, 10);
+  /** Records the peak RSS of the phase that just ended and the RSS left after it. */
+  const endPhase = (name: string): void => {
+    const rss = process.memoryUsage().rss;
+    phases.push([name, Math.max(phasePeak, rss), rss]);
+    phasePeak = rss;
+  };
 
   const pool = new FileHandlePool();
   const workers = new WorkerPool(path.join(root, 'dist'));
@@ -61,8 +74,10 @@ async function main(): Promise<void> {
   const indexMs = performance.now() - t0;
   await firstPage;
   if (outcome.status !== 'done') throw new Error('indexing did not finish');
+  endPhase('index build');
 
   const gotoMs = await measureGoto(reader, index.lineCount);
+  endPhase('go to line');
 
   // 2. Persist and reload from the sidecar.
   await store.save(file, { fileSize: outcome.fileSize, mtimeMs: outcome.mtimeMs, stride: index.stride, anchors: index.toFloat64Array() });
@@ -73,8 +88,21 @@ async function main(): Promise<void> {
   const cacheMs = performance.now() - tc;
   if (!restored || restored.lineCount !== index.lineCount) throw new Error('cache restore mismatch');
   const cachedGotoMs = await measureGoto(new ChunkReader(pool, file, restored), restored.lineCount);
+  endPhase('cache save/load');
+
+  // 3. Whole-file search in the search worker.
+  const searcher = workers.createSearchWorker();
+  const literal = await timeSearch(searcher, file, { text: 'NEEDLE_MARKER', caseSensitive: true, wholeWord: false, regex: false });
+  endPhase('literal search');
+  const regex = await timeSearch(searcher, file, { text: 'error \\[worker-1[0-5]\\] .*timeout', caseSensitive: false, wholeWord: false, regex: true });
+  endPhase('regex search');
+  searcher.dispose();
 
   clearInterval(sampler);
+  console.log('\nPhase                 peak RSS   RSS after');
+  for (const [name, peak, after] of phases) {
+    console.log(`${name.padEnd(20)} ${`${Math.round(peak / MB)} MB`.padStart(9)} ${`${Math.round(after / MB)} MB`.padStart(11)}`);
+  }
   peakRss = Math.max(peakRss, process.memoryUsage().rss);
 
   const rows: Row[] = [
@@ -82,7 +110,8 @@ async function main(): Promise<void> {
     { metric: 'Index build', value: ms(indexMs), limit: big ? '< 60 s' : '< 12 s', ok: indexMs < (big ? 60_000 : 12_000) },
     { metric: 'Index load from disk cache', value: ms(cacheMs), limit: 'instant', ok: undefined },
     { metric: 'Scroll 60 fps', value: 'manual', limit: '60 fps', ok: undefined },
-    { metric: 'Literal search, whole file', value: 'n/a (M3)', limit: big ? '< 30 s' : '< 6 s', ok: undefined },
+    { metric: 'Literal search, whole file', value: ms(literal.ms), limit: big ? '< 30 s' : '< 6 s', ok: literal.ms < (big ? 30_000 : 6_000) },
+    { metric: `Regex search, ci (${regex.hits} hits)`, value: ms(regex.ms), limit: 'info', ok: undefined },
     { metric: 'Peak RSS', value: `${Math.round(peakRss / MB)} MB`, limit: big ? '< 400 MB' : '< 250 MB', ok: peakRss < (big ? 400 : 250) * MB },
     { metric: 'Go to line, scanned (p99, 100 lines)', value: ms(gotoMs), limit: '< 50 ms', ok: gotoMs < 50 },
     { metric: 'Go to line, cached (p99, 100 lines)', value: ms(cachedGotoMs), limit: '< 50 ms', ok: cachedGotoMs < 50 },
@@ -104,6 +133,14 @@ async function main(): Promise<void> {
   workers.dispose();
   fs.rmSync(storeDir, { recursive: true, force: true });
   if (rows.some((r) => r.ok === false)) process.exitCode = 1;
+}
+
+async function timeSearch(worker: SearchWorker, file: string, query: SearchQuery): Promise<{ ms: number; hits: number }> {
+  let hits = 0;
+  const t = performance.now();
+  const outcome = await worker.search(file, query, { onProgress: (lines) => (hits += lines.length) }).result;
+  if (outcome.status !== 'done') throw new Error('search did not finish');
+  return { ms: performance.now() - t, hits };
 }
 
 async function measureGoto(reader: ChunkReader, lineCount: number): Promise<number> {

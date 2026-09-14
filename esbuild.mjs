@@ -26,7 +26,10 @@ const configs = [
   },
   {
     ...common,
-    entryPoints: { 'indexer.worker': 'src/workers/indexer.worker.ts' },
+    entryPoints: {
+      'indexer.worker': 'src/workers/indexer.worker.ts',
+      'search.worker': 'src/workers/search.worker.ts',
+    },
     outdir: 'dist',
     platform: 'node',
     format: 'cjs',

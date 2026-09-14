@@ -1,4 +1,5 @@
 /** Messages between the extension host and worker threads. */
+import type { SearchQuery } from '../shared/searchQuery';
 
 export interface IndexerWorkerData {
   filePath: string;
@@ -32,3 +33,34 @@ export type IndexerMessage =
     }
   | { type: 'cancelled' }
   | { type: 'error'; message: string; code?: string };
+
+export interface SearchWorkerData {
+  /**
+   * Int32 holding the id of the search that may run. The host stores a new id (or 0) to cancel
+   * the running search; the worker compares it between chunks.
+   */
+  generation: SharedArrayBuffer;
+}
+
+export interface SearchRequest {
+  type: 'search';
+  id: number;
+  filePath: string;
+  query: SearchQuery;
+  chunkBytes?: number;
+  overlapBytes?: number;
+  progressBytes?: number;
+}
+
+export type SearchMessage =
+  | {
+      type: 'progress';
+      id: number;
+      /** Matching line numbers since the previous message (transferred). */
+      lines: Float64Array;
+      bytesSearched: number;
+      fileSize: number;
+    }
+  | { type: 'done'; id: number; lines: Float64Array; bytesSearched: number; fileSize: number; elapsedMs: number }
+  | { type: 'cancelled'; id: number }
+  | { type: 'error'; id: number; message: string; code?: string };
