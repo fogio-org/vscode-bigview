@@ -1,5 +1,5 @@
 import { formatBytes, formatCount } from '../src/shared/format';
-import type { HitTarget, HostToWebview, SearchResultItem, WebviewToHost } from '../src/shared/protocol';
+import type { FilterMode, HitTarget, HostToWebview, SearchResultItem, WebviewToHost } from '../src/shared/protocol';
 import { compileQuery, findRanges, type SearchQuery } from '../src/shared/searchQuery';
 import { SearchBar } from './SearchBar';
 import './styles.css';
@@ -16,16 +16,20 @@ interface SavedState {
   topLine: number;
   query?: SearchQuery;
   resultsHeight?: number;
+  filterMode?: FilterMode;
 }
 
 interface CachedLine extends RowData {
+  /** File line shown in the row. */
+  lineNumber: number;
   /** searchVersion the highlight ranges were computed for. */
   v: number;
 }
 
 type SearchStateMessage = Extract<HostToWebview, { type: 'searchState' }>;
+type IndexMessage = Extract<HostToWebview, { type: 'index' }>;
 
-/** Lines are requested in aligned blocks; always <= MAX_LINES_PER_MESSAGE. */
+/** Rows are requested in aligned blocks; always <= MAX_LINES_PER_MESSAGE. */
 const LINE_BLOCK = 200;
 /** Results are requested in aligned blocks; always <= MAX_RESULTS_PER_MESSAGE. */
 const RESULT_BLOCK = 100;
@@ -49,13 +53,14 @@ const errorEl = $('error');
 const splitterEl = $('results-splitter');
 const resultsEl = $('results');
 
+/** Main list rows by row index (file lines, or filtered rows). */
 const lineCache = new Map<number, CachedLine>();
 const pendingLineBlocks = new Map<number, number>();
 const resultCache = new Map<number, SearchResultItem>();
 const pendingResultBlocks = new Map<number, number>();
 let reqSeq = 0;
 let lineCount = 0;
-let restoreLine = saved.topLine;
+let indexInfo: IndexMessage | undefined;
 let viewportTimer = 0;
 
 let searchId = 0;
@@ -66,6 +71,17 @@ let currentHit = -1;
 let currentHitLine = -1;
 /** Jump to the first hit once the new search produces one. */
 let autoJump = false;
+
+/** What the main list shows. Rows of a filtered view come from the host with their line numbers. */
+let viewMode: FilterMode = saved.query?.text ? (saved.filterMode ?? 'all') : 'all';
+/** Changes whenever the rows change meaning; responses for older views are dropped. */
+let viewId = 1;
+let viewCount = 0;
+/** Requested filter mode awaiting the host's filterState. */
+let pendingFilter: FilterMode | undefined;
+let restoreLine = viewMode === 'all' ? saved.topLine : 0;
+
+const rowCount = (): number => (viewMode === 'all' ? lineCount : viewCount);
 
 function post(msg: WebviewToHost): void {
   vscode.postMessage(msg);
@@ -110,8 +126,8 @@ function evict<T>(cache: Map<number, T>, max: number, center: number, radius: nu
   }
 }
 
-function lineRow(line: number): RowData | undefined {
-  const entry = lineCache.get(line);
+function lineRow(row: number): RowData | undefined {
+  const entry = lineCache.get(row);
   if (!entry) return undefined;
   if (entry.v !== searchVersion) {
     entry.ranges = searchRegex ? findRanges(entry.text, searchRegex) : undefined;
@@ -120,12 +136,21 @@ function lineRow(line: number): RowData | undefined {
   return entry;
 }
 
+/** File line shown in `row` of the main list, if known. */
+function fileLineOfRow(row: number): number | undefined {
+  return viewMode === 'all' ? row : lineCache.get(row)?.lineNumber;
+}
+
 const list = new VirtualList({
   container: $('viewport'),
   getRow: lineRow,
+  gutterText: (row) => {
+    const line = fileLineOfRow(row);
+    return line === undefined ? '' : String(line + 1);
+  },
   ensureRange: (start, end) =>
-    requestBlocks(start, end, LINE_BLOCK, lineCount, pendingLineBlocks, (i) => lineCache.has(i), (s, count) =>
-      post({ type: 'getLines', reqId: ++reqSeq, start: s, count }),
+    requestBlocks(start, end, LINE_BLOCK, rowCount(), pendingLineBlocks, (i) => lineCache.has(i), (s, count) =>
+      post({ type: 'getLines', reqId: ++reqSeq, start: s, count, viewId, mode: viewMode, searchId }),
     ),
   onScroll: (topLine) => {
     saved.topLine = topLine;
@@ -144,7 +169,7 @@ const results = new VirtualList({
     return item ? String(item.line + 1) : '';
   },
   ensureRange: (start, end) =>
-    requestBlocks(start, end, RESULT_BLOCK, searchState?.stored ?? 0, pendingResultBlocks, (i) => resultCache.has(i), (s, count) =>
+    requestBlocks(start, end, RESULT_BLOCK, searchState?.total ?? 0, pendingResultBlocks, (i) => resultCache.has(i), (s, count) =>
       post({ type: 'getResults', searchId, reqId: ++reqSeq, start: s, count }),
     ),
   onRowClick: (index) => gotoHit({ index }),
@@ -155,14 +180,36 @@ const bar = new SearchBar($('search-bar'), saved.query, {
   onNext: () => navigate(1),
   onPrevious: () => navigate(-1),
   onEscape: () => list.focus(),
+  onFilter: (mode) => requestFilter(mode),
 });
+bar.setFilter(viewMode, Boolean(saved.query?.text));
 
-function scheduleViewport(): void {
+/**
+ * Reports the viewport to the host: throttled while scrolling, immediately after discrete changes
+ * (timers can be throttled to 1 s when the window is in the background).
+ */
+function scheduleViewport(immediate = false): void {
+  if (immediate) {
+    window.clearTimeout(viewportTimer);
+    viewportTimer = 0;
+    postViewport();
+    return;
+  }
   if (viewportTimer !== 0) return;
   viewportTimer = window.setTimeout(() => {
     viewportTimer = 0;
-    post({ type: 'viewport', topLine: list.topLine, visibleLines: list.visibleLines });
+    postViewport();
   }, VIEWPORT_POST_MS);
+}
+
+function postViewport(): void {
+  post({ type: 'viewport', topLine: list.topLine, visibleLines: list.visibleLines, rowCount: rowCount(), mode: viewMode });
+}
+
+function resetRows(): void {
+  lineCache.clear();
+  pendingLineBlocks.clear();
+  list.refresh();
 }
 
 function startSearch(query: SearchQuery, jump: boolean): void {
@@ -178,16 +225,60 @@ function startSearch(query: SearchQuery, jump: boolean): void {
     searchRegex = undefined; // the host reports the error
   }
   searchVersion++;
+
+  const mode: FilterMode = query.text ? (pendingFilter ?? viewMode) : 'all';
+  pendingFilter = undefined;
+  if (mode !== 'all' || viewMode !== 'all') {
+    // Filtered rows are rebuilt from scratch for the new query (or the full file comes back).
+    const anchorLine = mode === 'all' ? (fileLineOfRow(list.topLine) ?? 0) : 0;
+    viewId++;
+    viewMode = mode;
+    viewCount = 0;
+    restoreLine = 0;
+    resetRows();
+    list.setCount(rowCount());
+    list.scrollToLine(anchorLine);
+  }
   list.refresh();
   list.setHighlight(-1);
   results.setCount(0);
   results.setHighlight(-1);
   setResultsVisible(query.text !== '');
+  bar.setFilter(mode, query.text !== '');
   autoJump = jump && query.text !== '';
   saved.query = query;
+  saved.filterMode = mode;
   saveState();
-  post({ type: 'search', searchId, query });
+  post({ type: 'search', searchId, query, mode });
   renderSearchStatus();
+  renderHeader();
+  scheduleViewport(true);
+}
+
+function requestFilter(mode: FilterMode): void {
+  if (!bar.value.text || !searchState) mode = 'all';
+  if (mode === (pendingFilter ?? viewMode)) return;
+  pendingFilter = mode;
+  viewId++;
+  bar.setFilter(mode, Boolean(bar.value.text));
+  post({ type: 'setFilter', searchId, viewId, mode, anchorIndex: list.topLine });
+}
+
+function applyView(mode: FilterMode, count: number, anchorIndex: number): void {
+  pendingFilter = undefined;
+  viewMode = mode;
+  viewCount = count;
+  restoreLine = 0;
+  resetRows();
+  list.setCount(rowCount());
+  list.setHighlight(-1);
+  list.scrollToLine(anchorIndex);
+  bar.setFilter(mode, Boolean(bar.value.text));
+  saved.filterMode = mode;
+  saveState();
+  renderHeader();
+  renderSearchStatus();
+  scheduleViewport(true);
 }
 
 function gotoHit(target: HitTarget): void {
@@ -195,9 +286,10 @@ function gotoHit(target: HitTarget): void {
 }
 
 function navigate(direction: 1 | -1): void {
-  if (!searchState || searchState.stored === 0) return;
-  const top = list.topLine;
-  const bottom = top + list.visibleLines;
+  if (!searchState || searchState.total === 0) return;
+  const top = fileLineOfRow(list.topLine) ?? 0;
+  const lastRow = Math.max(0, Math.min(rowCount(), list.topLine + list.visibleLines) - 1);
+  const bottom = (fileLineOfRow(lastRow) ?? top) + 1;
   if (currentHit >= 0 && currentHitLine >= top && currentHitLine < bottom) {
     gotoHit({ index: currentHit + direction });
   } else {
@@ -229,9 +321,22 @@ function renderSearchStatus(): void {
     const position = currentHit >= 0 ? `${formatCount(currentHit + 1)} of ` : '';
     text = `${position}${formatCount(s.total)} ${s.total === 1 ? 'result' : 'results'}`;
     if (running) text += ` · ${pct}%`;
-    if (s.stored < s.total) text += ` (first ${formatCount(s.stored)} listed)`;
   }
-  bar.setStatus(text, { progress: running ? pct : undefined, canNavigate: s.stored > 0 });
+  bar.setStatus(text, { progress: running ? pct : undefined, canNavigate: s.total > 0 });
+}
+
+function renderHeader(): void {
+  const m = indexInfo;
+  if (!m) return;
+  const pct = m.fileSize > 0 ? Math.floor((m.bytesIndexed / m.fileSize) * 100) : 100;
+  const lines = `${formatCount(m.lineCount)} lines`;
+  let text = m.done ? `${lines} · ${m.source === 'cache' ? 'index loaded from cache' : 'indexed'}` : `Indexing… ${pct}% · ${lines}`;
+  if (viewMode !== 'all') {
+    text = `Filter: ${formatCount(viewCount)} ${viewMode === 'matches' ? 'matching' : 'non-matching'} of ${text}`;
+  }
+  statusEl.textContent = text;
+  progressBarEl.style.width = `${pct}%`;
+  progressEl.classList.toggle('done', m.done);
 }
 
 function setResultsVisible(visible: boolean): void {
@@ -278,35 +383,35 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       fileNameEl.textContent = msg.fileName;
       fileInfoEl.textContent = formatBytes(msg.fileSize);
       break;
-    case 'index': {
+    case 'index':
+      indexInfo = msg;
       lineCount = msg.lineCount;
-      list.setCount(msg.lineCount);
+      list.setGutterMax(Math.max(1, msg.lineCount));
       results.setGutterMax(Math.max(1, msg.lineCount));
-      const pct = msg.fileSize > 0 ? Math.floor((msg.bytesIndexed / msg.fileSize) * 100) : 100;
-      const lines = `${formatCount(msg.lineCount)} lines`;
-      statusEl.textContent = msg.done
-        ? `${lines} · ${msg.source === 'cache' ? 'index loaded from cache' : 'indexed'}`
-        : `Indexing… ${pct}% · ${lines}`;
-      progressBarEl.style.width = `${pct}%`;
-      progressEl.classList.toggle('done', msg.done);
-      if (restoreLine > 0 && (msg.lineCount > restoreLine || msg.done)) {
+      if (viewMode === 'all') list.setCount(msg.lineCount);
+      renderHeader();
+      if (restoreLine > 0 && viewMode === 'all' && (msg.lineCount > restoreLine || msg.done)) {
         list.scrollToLine(restoreLine);
         restoreLine = 0;
       }
       break;
-    }
     case 'lines': {
+      if (msg.viewId !== viewId) break;
       const truncated = new Set(msg.truncated);
-      msg.lines.forEach((text, i) => lineCache.set(msg.start + i, { text, truncated: truncated.has(i), v: -1 }));
+      msg.lines.forEach((text, i) =>
+        lineCache.set(msg.start + i, { text, truncated: truncated.has(i), lineNumber: msg.lineNumbers?.[i] ?? msg.start + i, v: -1 }),
+      );
       pendingLineBlocks.delete(Math.floor(msg.start / LINE_BLOCK));
       evict(lineCache, MAX_CACHED_LINES, list.topLine, LINE_BLOCK * 3);
       list.invalidate();
       break;
     }
     case 'reveal':
+      if (msg.mode !== viewMode || pendingFilter !== undefined) break;
       restoreLine = 0;
-      list.revealLine(msg.line);
+      list.revealLine(msg.viewIndex);
       list.focus();
+      scheduleViewport(true);
       break;
     case 'error':
       errorEl.textContent = msg.message;
@@ -315,14 +420,21 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
     case 'searchState':
       if (msg.searchId !== searchId) break;
       searchState = msg;
-      results.setCount(msg.stored);
+      results.setCount(msg.total);
       results.invalidate();
-      if (autoJump && msg.stored > 0) {
+      if (viewMode !== 'all' && msg.mode === viewMode && pendingFilter === undefined && msg.viewCount !== viewCount) {
+        viewCount = msg.viewCount;
+        list.setCount(viewCount);
+        list.invalidate();
+        scheduleViewport(true);
+      }
+      if (autoJump && msg.total > 0) {
         autoJump = false;
-        gotoHit({ fromLine: list.topLine, direction: 1 });
+        gotoHit({ fromLine: fileLineOfRow(list.topLine) ?? 0, direction: 1 });
       }
       if (msg.status !== 'running') autoJump = false;
       renderSearchStatus();
+      renderHeader();
       break;
     case 'results':
       if (msg.searchId !== searchId) break;
@@ -336,18 +448,41 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       currentHit = msg.index;
       currentHitLine = msg.line;
       restoreLine = 0;
-      list.revealLine(msg.line, true);
+      if (msg.mode === viewMode && pendingFilter === undefined) list.revealLine(msg.viewIndex, true);
       results.setHighlight(msg.index);
       results.ensureVisible(msg.index);
       renderSearchStatus();
+      scheduleViewport(true);
+      break;
+    case 'filterState':
+      if (msg.searchId !== searchId || msg.viewId !== viewId) break;
+      applyView(msg.mode, msg.count, msg.anchorIndex);
       break;
     case 'command':
-      if (msg.command === 'find') bar.focus();
-      else navigate(msg.command === 'findNext' ? 1 : -1);
+      switch (msg.command) {
+        case 'find':
+          bar.focus();
+          break;
+        case 'findNext':
+          navigate(1);
+          break;
+        case 'findPrevious':
+          navigate(-1);
+          break;
+        case 'toggleFilter':
+          requestFilter((pendingFilter ?? viewMode) === 'all' ? 'matches' : 'all');
+          break;
+        case 'toggleInvert':
+          requestFilter((pendingFilter ?? viewMode) === 'nonMatches' ? 'matches' : 'nonMatches');
+          break;
+      }
       break;
     case 'setQuery':
       bar.setValue(msg.query);
       startSearch(msg.query, true);
+      break;
+    case 'setFilterMode':
+      requestFilter(msg.mode);
       break;
   }
 });

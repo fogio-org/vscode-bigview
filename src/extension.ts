@@ -1,11 +1,14 @@
+import * as fsp from 'node:fs/promises';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { FileHandlePool } from './core/FileHandlePool';
 import { IndexStore } from './core/IndexStore';
 import { BigViewProvider } from './editor/BigViewProvider';
 import { BigViewStatusBar } from './editor/StatusBar';
-import { formatCount } from './shared/format';
+import { isPro } from './license';
+import { formatBytes, formatCount } from './shared/format';
 import { parseLineNumber } from './shared/lineNumber';
-import { WorkerPool } from './workers/workerPool';
+import { WorkerPool, type ExportOutcome } from './workers/workerPool';
 
 /** Returned from `activate`; used by integration tests. */
 export interface BigViewApi {
@@ -31,6 +34,9 @@ export function activate(context: vscode.ExtensionContext): BigViewApi {
     vscode.commands.registerCommand('bigview.find', () => provider.active?.runCommand('find')),
     vscode.commands.registerCommand('bigview.findNext', () => provider.active?.runCommand('findNext')),
     vscode.commands.registerCommand('bigview.findPrevious', () => provider.active?.runCommand('findPrevious')),
+    vscode.commands.registerCommand('bigview.toggleFilter', () => provider.active?.runCommand('toggleFilter')),
+    vscode.commands.registerCommand('bigview.toggleInvert', () => provider.active?.runCommand('toggleInvert')),
+    vscode.commands.registerCommand('bigview.exportFiltered', (target?: unknown) => exportFiltered(provider, workers, target)),
     statusBar,
     provider,
     { dispose: () => workers.dispose() },
@@ -77,6 +83,130 @@ async function goToLine(provider: BigViewProvider, line?: unknown): Promise<void
   }
   if (target === undefined || lineCount() === 0) return;
   editor.reveal(Math.min(Math.max(1, Math.floor(target)), lineCount()) - 1);
+}
+
+export interface ExportResult {
+  target: vscode.Uri;
+  mode: 'matches' | 'nonMatches';
+  lines: number;
+  bytes: number;
+  elapsedMs: number;
+}
+
+/**
+ * BigView: Export Filtered Lines. Writes the lines selected by the filter (matching lines, or
+ * non-matching ones when inverted) to a new file, streaming in a worker. `target` skips the
+ * save dialog (used by tests).
+ */
+async function exportFiltered(provider: BigViewProvider, workers: WorkerPool, target?: unknown): Promise<ExportResult | undefined> {
+  const editor = provider.active;
+  if (!editor) {
+    void vscode.window.showInformationMessage('Open a file in BigView to export lines.');
+    return undefined;
+  }
+  if (!isPro()) {
+    void vscode.window.showWarningMessage('Exporting lines requires BigView Pro.');
+    return undefined;
+  }
+  const search = editor.search;
+  if (!search.state.query) {
+    void vscode.window.showInformationMessage('Search first: the export writes the lines selected by the search filter.');
+    return undefined;
+  }
+  let state = search.state;
+  if (state.status === 'running') {
+    state = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'BigView: waiting for the search to finish…' },
+      () => search.whenSettled(),
+    );
+  }
+  if (state.status !== 'done') {
+    void vscode.window.showErrorMessage(`Cannot export: ${state.error ?? 'the search did not finish'}.`);
+    return undefined;
+  }
+  const selection = search.exportSelection();
+  if (!selection) return undefined;
+  if (selection.count === 0) {
+    void vscode.window.showInformationMessage('No lines to export.');
+    return undefined;
+  }
+
+  const source = editor.doc.uri.fsPath;
+  const describe = selection.mode === 'matches' ? 'matching' : 'non-matching';
+  let dest = target instanceof vscode.Uri ? target : undefined;
+  if (!dest) {
+    const parsed = path.parse(source);
+    const suffix = selection.mode === 'matches' ? 'filtered' : 'excluded';
+    dest = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(path.join(parsed.dir, `${parsed.name}.${suffix}${parsed.ext}`)),
+      saveLabel: 'Export',
+      title: `Export ${formatCount(selection.count)} ${describe} lines`,
+    });
+    if (!dest) return undefined;
+  }
+  if (dest.scheme !== 'file') {
+    void vscode.window.showErrorMessage('BigView can only export to local files.');
+    return undefined;
+  }
+  const destPath = dest.fsPath;
+  if ((await realPath(destPath)) === (await realPath(source))) {
+    void vscode.window.showErrorMessage('Cannot export into the file being viewed.');
+    return undefined;
+  }
+
+  const started = performance.now();
+  let outcome: ExportOutcome;
+  try {
+    outcome = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `BigView: exporting ${formatCount(selection.count)} ${describe} lines`,
+        cancellable: true,
+      },
+      async (progress, token) => {
+        let reported = 0;
+        const task = workers.exportLines(
+          { source, target: destPath, words: selection.words, invert: selection.mode === 'nonMatches', lineCount: selection.lineCount },
+          (bytesRead, fileSize, linesWritten) => {
+            const pct = fileSize > 0 ? (bytesRead / fileSize) * 100 : 100;
+            progress.report({ increment: pct - reported, message: `${formatCount(linesWritten)} lines written` });
+            reported = pct;
+          },
+        );
+        token.onCancellationRequested(() => task.cancel());
+        return task.result;
+      },
+    );
+  } catch (err) {
+    await fsp.rm(destPath, { force: true });
+    void vscode.window.showErrorMessage(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+  if (outcome.status === 'cancelled') {
+    await fsp.rm(destPath, { force: true });
+    return undefined;
+  }
+
+  const result: ExportResult = {
+    target: dest,
+    mode: selection.mode,
+    lines: outcome.linesWritten,
+    bytes: outcome.bytesWritten,
+    elapsedMs: performance.now() - started,
+  };
+  if (!(target instanceof vscode.Uri)) {
+    const exported = dest;
+    void vscode.window
+      .showInformationMessage(`Exported ${formatCount(result.lines)} lines (${formatBytes(result.bytes)}) to ${path.basename(destPath)}.`, 'Open')
+      .then((choice) => {
+        if (choice === 'Open') void vscode.commands.executeCommand('vscode.open', exported);
+      });
+  }
+  return result;
+}
+
+async function realPath(p: string): Promise<string> {
+  return fsp.realpath(p).catch(() => path.resolve(p));
 }
 
 function activeTabUri(): vscode.Uri | undefined {

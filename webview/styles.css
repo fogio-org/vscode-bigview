@@ -334,6 +334,19 @@ body {
   cursor: default;
 }
 
+.sb-mode {
+  margin-left: 4px;
+  padding: 1px 8px;
+  border: 1px solid var(--vscode-button-secondaryBackground, transparent);
+  font-size: 12px;
+}
+
+.sb-mode[aria-pressed='true'] {
+  background: var(--vscode-inputOption-activeBackground);
+  border-color: var(--vscode-inputOption-activeBorder);
+  color: var(--vscode-inputOption-activeForeground);
+}
+
 .sb-progress {
   position: absolute;
   left: 0;

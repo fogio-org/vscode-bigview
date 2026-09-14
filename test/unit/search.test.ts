@@ -232,6 +232,32 @@ describe('progress and cancellation', () => {
     });
   });
 
+  it('reports lines searched consistently with the hits delivered', () => {
+    const data = corpus(9, 500);
+    const src = Buffer.from(data);
+    const query = q('foo', { caseSensitive: false });
+    const expected = reference(data, query);
+    const hits: number[] = [];
+    const checks: Array<[number, number]> = [];
+    const summary = searchFile(
+      (buf, offset, length, position) => (position >= src.length ? 0 : src.copy(buf, offset, position, Math.min(position + length, src.length))),
+      src.length,
+      query,
+      {
+        hit: (line) => hits.push(line),
+        progress: (_bytes, lines) => checks.push([lines, hits.length]),
+        isCancelled: (_bytes, lines) => {
+          checks.push([lines, hits.length]);
+          return false;
+        },
+      },
+      { chunkBytes: 128, progressBytes: 300 },
+    );
+    expect(checks.length).toBeGreaterThan(10);
+    for (const [lines, seen] of checks) expect(seen).toBe(expected.filter((l) => l < lines).length);
+    expect(summary.lineCount).toBe(naiveText(data).length);
+  });
+
   it('stops between chunks when cancelled', () => {
     const data = enc('NEEDLE\n'.repeat(1000));
     const r = run(data, q('NEEDLE'), { chunkBytes: 70 }, 2);

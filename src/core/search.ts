@@ -32,9 +32,9 @@ export interface SearchSink {
   /** A matching line (0-based). Ascending, at most once per line. */
   hit(line: number): void;
   /** Called each time another `progressBytes` have been searched. */
-  progress(bytesSearched: number): void;
-  /** Checked between chunks. */
-  isCancelled(bytesSearched: number): boolean;
+  progress(bytesSearched: number, linesSearched: number): void;
+  /** Checked between chunks; every hit below `linesSearched` has been reported. */
+  isCancelled(bytesSearched: number, linesSearched: number): boolean;
 }
 
 export interface SearchOptions {
@@ -202,16 +202,16 @@ export function searchFile(
   const emit = (line: number): void => sink.hit(line);
 
   let nextProgress = progressBytes;
-  const report = (pos: number): void => {
+  const report = (pos: number, lines: number): void => {
     if (pos < nextProgress) return;
-    sink.progress(pos);
+    sink.progress(pos, lines);
     nextProgress = (Math.floor(pos / progressBytes) + 1) * progressBytes;
   };
 
   let start = 0;
   let line = 0;
   while (start < fileSize) {
-    if (sink.isCancelled(start)) return { status: 'cancelled', bytesSearched: start, lineCount: line };
+    if (sink.isCancelled(start, line)) return { status: 'cancelled', bytesSearched: start, lineCount: line };
     const want = Math.min(buf.length, fileSize - start);
     const n = readFully(read, buf, want, start);
     if (n === 0) break; // file shrank underneath us
@@ -226,7 +226,7 @@ export function searchFile(
         if (next === undefined) return { status: 'cancelled', bytesSearched: start, lineCount: line };
         line++;
         start = next;
-        report(start);
+        report(start, line);
         continue;
       }
       end = lastNl + 1;
@@ -241,7 +241,7 @@ export function searchFile(
       from = to;
     }
     start += end;
-    report(start);
+    report(start, line);
   }
   return { status: 'done', bytesSearched: start, lineCount: line };
 }
@@ -260,7 +260,7 @@ function searchLongLine(
   matcher: LineMatcher,
   overlap: number,
   sink: SearchSink,
-  report: (pos: number) => void,
+  report: (pos: number, lines: number) => void,
 ): number | undefined {
   let winStart = lineStart;
   let requested = n;
@@ -278,13 +278,13 @@ function searchLongLine(
       if (matched) sink.hit(line);
       return nl !== -1 ? winStart + nl + 1 : winStart + n;
     }
-    if (sink.isCancelled(winStart)) return undefined;
+    if (sink.isCancelled(winStart, line)) return undefined;
     // Overlap windows only while a match is still possible; afterwards just look for `\n`.
     const next = winStart + n - (matched ? 0 : overlap);
     requested = Math.min(buf.length, fileSize - next);
     n = readFully(read, buf, requested, next);
     winStart = next;
-    report(winStart);
+    report(winStart, line);
   }
 }
 
@@ -292,7 +292,7 @@ function hasBom(b: Buffer): boolean {
   return b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf;
 }
 
-function readFully(read: ReadFn, buf: Buffer, length: number, position: number): number {
+export function readFully(read: ReadFn, buf: Buffer, length: number, position: number): number {
   let total = 0;
   while (total < length) {
     const r = read(buf, total, length - total, position + total);

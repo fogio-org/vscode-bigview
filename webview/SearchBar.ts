@@ -4,6 +4,7 @@
  * F3 / Shift+F3 / Ctrl+F are VS Code keybindings (the webview forwards every keydown to the
  * workbench), so only keys that VS Code does not bind in this context are handled here.
  */
+import type { FilterMode } from '../src/shared/protocol';
 import { EMPTY_QUERY, type SearchQuery } from '../src/shared/searchQuery';
 
 export interface SearchBarHandlers {
@@ -11,6 +12,7 @@ export interface SearchBarHandlers {
   onNext(): void;
   onPrevious(): void;
   onEscape(): void;
+  onFilter(mode: FilterMode): void;
 }
 
 export interface SearchStatusView {
@@ -39,6 +41,9 @@ export class SearchBar {
   private readonly prev: HTMLButtonElement;
   private readonly next: HTMLButtonElement;
   private readonly toggles = new Map<OptionKey, HTMLButtonElement>();
+  private readonly filterButton: HTMLButtonElement;
+  private readonly invertButton: HTMLButtonElement;
+  private mode: FilterMode = 'all';
   private query: SearchQuery;
   /** Last query handed to onQuery, serialized. */
   private emitted: string;
@@ -74,7 +79,16 @@ export class SearchBar {
     this.prev = button('↑', 'Previous Match (Shift+F3)', () => this.navigate(-1));
     this.next = button('↓', 'Next Match (F3)', () => this.navigate(1));
     this.progress = el('div', 'sb-progress');
-    root.append(this.field, this.count, this.prev, this.next, this.progress);
+    this.filterButton = button('Filter', 'Show only matching lines', () =>
+      this.handlers.onFilter(this.mode === 'all' ? 'matches' : 'all'),
+    );
+    this.invertButton = button('Invert', 'Show only lines that do not match', () =>
+      this.handlers.onFilter(this.mode === 'nonMatches' ? 'matches' : 'nonMatches'),
+    );
+    this.filterButton.classList.add('sb-mode', 'sb-filter');
+    this.invertButton.classList.add('sb-mode', 'sb-invert');
+    root.append(this.field, this.count, this.prev, this.next, this.filterButton, this.invertButton, this.progress);
+    this.setFilter('all', false);
 
     this.input.addEventListener('input', () => {
       this.query = { ...this.query, text: this.input.value };
@@ -109,6 +123,14 @@ export class SearchBar {
     this.progress.hidden = view.progress === undefined;
     this.progress.style.width = `${view.progress ?? 0}%`;
     this.prev.disabled = this.next.disabled = !view.canNavigate;
+  }
+
+  /** Reflects the filter mode; the buttons are enabled only while there is a query. */
+  setFilter(mode: FilterMode, enabled: boolean): void {
+    this.mode = mode;
+    this.filterButton.setAttribute('aria-pressed', String(mode !== 'all'));
+    this.invertButton.setAttribute('aria-pressed', String(mode === 'nonMatches'));
+    this.filterButton.disabled = this.invertButton.disabled = !enabled;
   }
 
   private render(): void {

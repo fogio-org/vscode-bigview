@@ -34,17 +34,19 @@ function run(req: SearchRequest): void {
     let pending = new Float64Array(1024);
     let count = 0;
     let lastFlush = performance.now();
+    // Position at the last chunk boundary: all hits below linesSearched are already found.
+    let bytesSearched = 0;
+    let linesSearched = 0;
     const take = (): Float64Array => {
       const out = pending.slice(0, count);
       count = 0;
       return out;
     };
-    const flush = (bytesSearched: number): void => {
-      post({ type: 'progress', id: req.id, lines: take(), bytesSearched, fileSize });
+    const flush = (): void => {
+      post({ type: 'progress', id: req.id, lines: take(), bytesSearched, linesSearched, fileSize });
       lastFlush = performance.now();
     };
 
-    let position = 0;
     const summary = searchFile(
       (buf, offset, length, pos) => fs.readSync(handle, buf, offset, length, pos),
       fileSize,
@@ -53,7 +55,7 @@ function run(req: SearchRequest): void {
         hit: (line) => {
           if (count === pending.length) {
             if (count >= MAX_PENDING_HITS) {
-              flush(position);
+              flush();
             } else {
               const grown = new Float64Array(pending.length * 2);
               grown.set(pending);
@@ -62,13 +64,15 @@ function run(req: SearchRequest): void {
           }
           pending[count++] = line;
         },
-        progress: (bytes) => {
-          position = bytes;
-          flush(bytes);
+        progress: (bytes, lines) => {
+          bytesSearched = bytes;
+          linesSearched = lines;
+          flush();
         },
-        isCancelled: (bytes) => {
-          position = bytes;
-          if (count > 0 && performance.now() - lastFlush >= HIT_FLUSH_MS) flush(bytes);
+        isCancelled: (bytes, lines) => {
+          bytesSearched = bytes;
+          linesSearched = lines;
+          if (count > 0 && performance.now() - lastFlush >= HIT_FLUSH_MS) flush();
           return cancelled();
         },
       },
@@ -84,6 +88,7 @@ function run(req: SearchRequest): void {
       id: req.id,
       lines: take(),
       bytesSearched: summary.bytesSearched,
+      lineCount: summary.lineCount,
       fileSize,
       elapsedMs: performance.now() - started,
     });

@@ -9,7 +9,13 @@ import { restoreLineIndex, type IndexStore } from '../core/IndexStore';
 import { LineIndex } from '../core/LineIndex';
 import { FREE_FILE_SIZE_LIMIT, isPro } from '../license';
 import type { IndexSource, IndexState, StatusInfo } from '../shared/format';
-import { MAX_LINES_PER_MESSAGE, type HostToWebview, type WebviewCommand, type WebviewToHost } from '../shared/protocol';
+import {
+  MAX_LINES_PER_MESSAGE,
+  type FilterMode,
+  type HostToWebview,
+  type WebviewCommand,
+  type WebviewToHost,
+} from '../shared/protocol';
 import type { SearchQuery } from '../shared/searchQuery';
 import type { IndexOutcome, WorkerPool } from '../workers/workerPool';
 import { SearchController } from './SearchController';
@@ -152,12 +158,17 @@ export interface BigViewEditor {
   readonly visibleLines: number;
   readonly onDidChangeViewport: vscode.Event<void>;
   readonly search: SearchController;
-  /** Scrolls to and highlights a 0-based line. */
+  /** Rows in the webview list and its filter mode, as last reported by the webview. */
+  readonly rowCount: number;
+  readonly viewMode: FilterMode;
+  /** Scrolls to and highlights a 0-based file line. */
   reveal(line: number): void;
-  /** Forwards a keybinding command (find, find next/previous) to the webview. */
+  /** Forwards a keybinding command (find, find next/previous, filter toggles) to the webview. */
   runCommand(command: WebviewCommand): void;
   /** Types `query` into the webview search bar and runs it. */
   setQuery(query: SearchQuery): void;
+  /** Switches the webview filter as if its buttons were used. */
+  setFilterMode(mode: FilterMode): void;
   /** Handles a message as if it came from the webview (also used by integration tests). */
   dispatch(msg: WebviewToHost): void;
 }
@@ -222,19 +233,25 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
     const viewportEmitter = new vscode.EventEmitter<void>();
     const search = new SearchController(doc, () => doc.createSearchWorker(), post);
 
+    const postReveal = (line: number): void =>
+      post({ type: 'reveal', line, viewIndex: search.viewIndexOfLine(line), mode: search.mode });
+
     const editor = {
       doc,
       panel,
       search,
       topLine: 0,
       visibleLines: 0,
+      rowCount: 0,
+      viewMode: 'all' as FilterMode,
       onDidChangeViewport: viewportEmitter.event,
       reveal: (line: number) => {
-        if (ready) post({ type: 'reveal', line });
+        if (ready) postReveal(line);
         else pendingReveal = line;
       },
       runCommand: (command: WebviewCommand) => post({ type: 'command', command }),
       setQuery: (query: SearchQuery) => post({ type: 'setQuery', query }),
+      setFilterMode: (mode: FilterMode) => post({ type: 'setFilterMode', mode }),
       dispatch: (msg: WebviewToHost) => {
         switch (msg.type) {
           case 'ready':
@@ -242,15 +259,19 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
             search.reset();
             post({ type: 'init', fileName: path.basename(doc.uri.fsPath), fileSize: doc.fileSize });
             postState();
-            if (pendingReveal !== undefined) post({ type: 'reveal', line: pendingReveal });
+            if (pendingReveal !== undefined) postReveal(pendingReveal);
             pendingReveal = undefined;
             break;
           case 'getLines': {
+            if (msg.mode !== 'all') {
+              search.sendViewLines(msg);
+              break;
+            }
             const count = Math.min(msg.count, MAX_LINES_PER_MESSAGE);
             doc.reader.readLines(msg.start, count).then(
               (res) => {
                 doc.firstLinesAt ??= performance.now();
-                post({ type: 'lines', reqId: msg.reqId, start: res.start, lines: res.lines, truncated: res.truncated });
+                post({ type: 'lines', reqId: msg.reqId, viewId: msg.viewId, start: res.start, lines: res.lines, truncated: res.truncated });
               },
               (err: unknown) => post({ type: 'error', message: `Read failed: ${String(err)}` }),
             );
@@ -259,10 +280,15 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
           case 'viewport':
             editor.topLine = msg.topLine;
             editor.visibleLines = msg.visibleLines;
+            editor.rowCount = msg.rowCount;
+            editor.viewMode = msg.mode;
             viewportEmitter.fire();
             break;
           case 'search':
-            search.start(msg.searchId, msg.query);
+            search.start(msg.searchId, msg.query, msg.mode);
+            break;
+          case 'setFilter':
+            search.setFilter(msg.searchId, msg.viewId, msg.mode, msg.anchorIndex);
             break;
           case 'getResults':
             search.sendResults(msg.searchId, msg.reqId, msg.start, msg.count);

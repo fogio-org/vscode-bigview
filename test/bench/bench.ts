@@ -14,6 +14,7 @@ import { ChunkReader } from '../../src/core/ChunkReader';
 import { FileHandlePool } from '../../src/core/FileHandlePool';
 import { IndexStore, restoreLineIndex } from '../../src/core/IndexStore';
 import { LineIndex } from '../../src/core/LineIndex';
+import { LineSet } from '../../src/core/LineSet';
 import type { SearchQuery } from '../../src/shared/searchQuery';
 import { WorkerPool, type SearchWorker } from '../../src/workers/workerPool';
 import { parseSize, type GenerateResult } from '../fixtures/generate';
@@ -94,9 +95,22 @@ async function main(): Promise<void> {
   const searcher = workers.createSearchWorker();
   const literal = await timeSearch(searcher, file, { text: 'NEEDLE_MARKER', caseSensitive: true, wholeWord: false, regex: false });
   endPhase('literal search');
-  const regex = await timeSearch(searcher, file, { text: 'error \\[worker-1[0-5]\\] .*timeout', caseSensitive: false, wholeWord: false, regex: true });
-  endPhase('regex search');
+  const filterSet = new LineSet();
+  const filter = await timeSearch(searcher, file, { text: '^\\S+ ERROR \\[worker-[0-8]\\]', caseSensitive: true, wholeWord: false, regex: true }, filterSet);
+  endPhase('regex filter');
   searcher.dispose();
+
+  // 4. Export the filtered lines (streaming, in the export worker).
+  const rssBeforeExport = process.memoryUsage().rss;
+  const te = performance.now();
+  const exported = await workers.exportLines(
+    { source: file, target: path.join(storeDir, 'export.log'), words: filterSet.toWords(), invert: false, lineCount: filter.lineCount },
+    () => undefined,
+  ).result;
+  const exportMs = performance.now() - te;
+  endPhase('export');
+  if (exported.status !== 'done') throw new Error('export did not finish');
+  const exportDelta = (phases[phases.length - 1]?.[1] ?? rssBeforeExport) - rssBeforeExport;
 
   clearInterval(sampler);
   console.log('\nPhase                 peak RSS   RSS after');
@@ -111,7 +125,9 @@ async function main(): Promise<void> {
     { metric: 'Index load from disk cache', value: ms(cacheMs), limit: 'instant', ok: undefined },
     { metric: 'Scroll 60 fps', value: 'manual', limit: '60 fps', ok: undefined },
     { metric: 'Literal search, whole file', value: ms(literal.ms), limit: big ? '< 30 s' : '< 6 s', ok: literal.ms < (big ? 30_000 : 6_000) },
-    { metric: `Regex search, ci (${regex.hits} hits)`, value: ms(regex.ms), limit: 'info', ok: undefined },
+    { metric: `Regex filter (${filter.hits} lines)`, value: ms(filter.ms), limit: big ? '< 30 s' : '< 6 s', ok: filter.ms < (big ? 30_000 : 6_000) },
+    { metric: `Export ${exported.linesWritten} lines`, value: ms(exportMs), limit: 'info', ok: undefined },
+    { metric: 'Export RSS increase', value: `${Math.round(exportDelta / MB)} MB`, limit: '< 50 MB', ok: exportDelta < 50 * MB },
     { metric: 'Peak RSS', value: `${Math.round(peakRss / MB)} MB`, limit: big ? '< 400 MB' : '< 250 MB', ok: peakRss < (big ? 400 : 250) * MB },
     { metric: 'Go to line, scanned (p99, 100 lines)', value: ms(gotoMs), limit: '< 50 ms', ok: gotoMs < 50 },
     { metric: 'Go to line, cached (p99, 100 lines)', value: ms(cachedGotoMs), limit: '< 50 ms', ok: cachedGotoMs < 50 },
@@ -135,12 +151,22 @@ async function main(): Promise<void> {
   if (rows.some((r) => r.ok === false)) process.exitCode = 1;
 }
 
-async function timeSearch(worker: SearchWorker, file: string, query: SearchQuery): Promise<{ ms: number; hits: number }> {
+async function timeSearch(
+  worker: SearchWorker,
+  file: string,
+  query: SearchQuery,
+  collect?: LineSet,
+): Promise<{ ms: number; hits: number; lineCount: number }> {
   let hits = 0;
   const t = performance.now();
-  const outcome = await worker.search(file, query, { onProgress: (lines) => (hits += lines.length) }).result;
+  const outcome = await worker.search(file, query, {
+    onProgress: (lines) => {
+      hits += lines.length;
+      collect?.addAll(lines);
+    },
+  }).result;
   if (outcome.status !== 'done') throw new Error('search did not finish');
-  return { ms: performance.now() - t, hits };
+  return { ms: performance.now() - t, hits, lineCount: outcome.lineCount };
 }
 
 async function measureGoto(reader: ChunkReader, lineCount: number): Promise<number> {

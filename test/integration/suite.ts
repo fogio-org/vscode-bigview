@@ -4,12 +4,13 @@
  */
 import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { BigViewDocument, BigViewEditor } from '../../src/editor/BigViewProvider';
 import type { SearchState } from '../../src/editor/SearchController';
-import type { BigViewApi } from '../../src/extension';
+import type { BigViewApi, ExportResult } from '../../src/extension';
 import { formatCount } from '../../src/shared/format';
-import type { HitTarget } from '../../src/shared/protocol';
+import type { FilterMode, HitTarget } from '../../src/shared/protocol';
 import { compileQuery, type SearchQuery } from '../../src/shared/searchQuery';
 import type { GenerateResult } from '../fixtures/generate';
 import { enabledTiers, FIXTURES, loadFixture, type FixtureSpec } from './fixtures';
@@ -268,7 +269,7 @@ async function runSearch(editor: BigViewEditor, input: QueryInput, timeoutMs = 3
   );
   const ms = performance.now() - t0;
   // The webview jumps to the first hit on its own; let that settle before navigating.
-  if (state.status === 'done' && state.stored > 0) {
+  if (state.status === 'done' && state.total > 0) {
     await waitFor(() => editor.search.lastHit?.searchId === state.searchId || undefined, 5000, 'auto-jump to the first hit');
   }
   return { state, ms };
@@ -370,6 +371,120 @@ test('a new query replaces the running search; an invalid regex reports an error
   assert.match(bad.state.error ?? '', /Invalid regular expression/);
 });
 
+// ---------------------------------------------------------------------------
+// Filter and export (M4)
+
+/** Uses the webview's filter buttons path and waits until the webview shows the new rows. */
+async function setFilterMode(editor: BigViewEditor, mode: FilterMode): Promise<number> {
+  const t0 = performance.now();
+  // Stage timestamps, printed when a switch is slow.
+  const stages: string[] = [];
+  const mark = (name: string): void => {
+    stages.push(`${name} +${(performance.now() - t0).toFixed(0)}ms`);
+  };
+  const subs = [
+    editor.search.onDidChange(() => mark(`host mode=${editor.search.mode}`)),
+    editor.onDidChangeViewport(() => mark(`viewport mode=${editor.viewMode} rows=${editor.rowCount}`)),
+  ];
+  try {
+    editor.setFilterMode(mode);
+    await waitFor(
+      () => (editor.search.mode === mode && editor.viewMode === mode && editor.rowCount === editor.search.viewCount(mode)) || undefined,
+      10_000,
+      `filter ${mode} (webview ${editor.viewMode} with ${editor.rowCount} rows, host ${editor.search.mode})`,
+    );
+  } finally {
+    subs.forEach((s) => s.dispose());
+  }
+  const ms = performance.now() - t0;
+  if (ms > 300) console.log(`    slow switch to ${mode} (${ms.toFixed(0)} ms): ${stages.join(', ')}`);
+  return ms;
+}
+
+async function gotoRow(editor: BigViewEditor, searchId: number, target: HitTarget, row: number): Promise<void> {
+  editor.search.lastHit = undefined;
+  editor.dispatch({ type: 'gotoHit', searchId, target });
+  await waitFor(() => editor.search.lastHit, 5000, `hit for ${JSON.stringify(target)}`);
+  await waitFor(
+    () => (editor.topLine <= row && row < editor.topLine + editor.visibleLines) || undefined,
+    5000,
+    `row ${row} visible (top ${editor.topLine}, visible ${editor.visibleLines})`,
+  );
+}
+
+function rawLines(file: string): Buffer[] {
+  const raw = fs.readFileSync(file);
+  const out: Buffer[] = [];
+  for (let s = 0; s < raw.length; ) {
+    const nl = raw.indexOf(10, s);
+    const e = nl === -1 ? raw.length : nl + 1;
+    out.push(raw.subarray(s, e));
+    s = e;
+  }
+  return out;
+}
+
+test('filter shows only matching lines, inverts, keeps the position and maps navigation', async () => {
+  const gen = fixture(FIXTURES.small);
+  const { editor } = await open(gen);
+  const all = fileLines(gen.path);
+  const { state } = await runSearch(editor, { text: 'NEEDLE_MARKER' });
+  const hits = editor.search.hitLines();
+  const nonHits = all.flatMap((t, i) => (t.includes('NEEDLE_MARKER') ? [] : [i]));
+
+  const onMs = await setFilterMode(editor, 'matches');
+  assert.equal(editor.rowCount, hits.length);
+  const matchView = await editor.search.readView(state.searchId, 'matches', 0, 500);
+  assert.deepEqual(matchView?.lineNumbers, hits);
+  assert.deepEqual(matchView?.lines, hits.map((l) => all[l]));
+  await gotoRow(editor, state.searchId, { index: 20 }, 20);
+
+  const invertMs = await setFilterMode(editor, 'nonMatches');
+  assert.equal(editor.rowCount, nonHits.length);
+  const invView = await editor.search.readView(state.searchId, 'nonMatches', 40_000, 500);
+  assert.deepEqual(invView?.lineNumbers, nonHits.slice(40_000, 40_500));
+  assert.deepEqual(invView?.lines, nonHits.slice(40_000, 40_500).map((l) => all[l]));
+
+  const offMs = await setFilterMode(editor, 'all');
+  assert.equal(editor.rowCount, all.length);
+  console.log(`    switch: filter ${onMs.toFixed(0)} ms, invert ${invertMs.toFixed(0)} ms, off ${offMs.toFixed(0)} ms`);
+
+  // The file line at the top stays at the top when the filter changes.
+  editor.reveal(60_000);
+  await waitFor(() => (editor.topLine > 59_000 && editor.topLine <= 60_000) || undefined, 5000, `reveal (top ${editor.topLine})`);
+  const topBefore = editor.topLine;
+  await setFilterMode(editor, 'nonMatches');
+  const anchored = editor.search.viewIndexOfLine(topBefore, 'nonMatches');
+  await waitFor(() => editor.topLine === anchored || undefined, 5000, `anchored top ${anchored} (is ${editor.topLine})`);
+  await setFilterMode(editor, 'all');
+  await waitFor(() => editor.topLine === topBefore || undefined, 5000, `restored top ${topBefore} (is ${editor.topLine})`);
+});
+
+test('export writes exactly the selected lines, for a filter and its inverse', async () => {
+  const gen = fixture(FIXTURES.small);
+  const { editor } = await open(gen);
+  const lines = rawLines(gen.path);
+  await runSearch(editor, { text: 'NEEDLE_MARKER' });
+  const matchesOut = path.join(ROOT, 'test', '.tmp', 'it-export-matches.txt');
+  const invertOut = path.join(ROOT, 'test', '.tmp', 'it-export-inverted.txt');
+  try {
+    const r1 = await vscode.commands.executeCommand<ExportResult | undefined>('bigview.exportFiltered', vscode.Uri.file(matchesOut));
+    assert.equal(r1?.mode, 'matches');
+    assert.equal(r1?.lines, gen.markerLines);
+    assert.ok(fs.readFileSync(matchesOut).equals(Buffer.concat(lines.filter((l) => l.includes('NEEDLE_MARKER')))), 'matching lines');
+
+    await setFilterMode(editor, 'nonMatches');
+    const r2 = await vscode.commands.executeCommand<ExportResult | undefined>('bigview.exportFiltered', vscode.Uri.file(invertOut));
+    assert.equal(r2?.mode, 'nonMatches');
+    assert.equal(r2?.lines, lines.length - gen.markerLines);
+    assert.ok(fs.readFileSync(invertOut).equals(Buffer.concat(lines.filter((l) => !l.includes('NEEDLE_MARKER')))), 'non-matching lines');
+    console.log(`    exported ${r1?.lines} lines in ${r1?.elapsedMs.toFixed(0)} ms, ${r2?.lines} lines in ${r2?.elapsedMs.toFixed(0)} ms`);
+  } finally {
+    fs.rmSync(matchesOut, { force: true });
+    fs.rmSync(invertOut, { force: true });
+  }
+});
+
 if (TIERS.has('large')) {
   for (const [label, spec] of [['200 MB', FIXTURES.m200], ['1 GB', FIXTURES.g1]] as const) {
     test(`opens a ${label} log: first page < ${FIRST_PAGE_BUDGET_MS} ms, index is exact`, async () => {
@@ -419,6 +534,72 @@ if (TIERS.has('large')) {
       const r = await runSearch(editor, input, 60_000);
       console.log(`    ${JSON.stringify(input)}: ${r.state.total} hits in ${r.ms.toFixed(0)} ms`);
       assert.equal(r.state.total, 137);
+    }
+  });
+}
+
+if (TIERS.has('large')) {
+  test('M4 acceptance: 1 GB regex filter builds as fast as search, switching is instant, exporting ~500k lines keeps memory flat', async () => {
+    const gen = fixture(FIXTURES.g1);
+    const { doc, editor } = await open(gen);
+    const query: QueryInput = { text: '^\\S+ ERROR \\[worker-[0-8]\\]', regex: true };
+    const re = compileQuery({ caseSensitive: true, wholeWord: false, ...query, regex: true }).regex;
+
+    const plain = await runSearch(editor, query, 60_000);
+    await setFilterMode(editor, 'matches');
+    const filtered = await runSearch(editor, query, 60_000); // re-run with the filter on: rows fill in as found
+    await waitFor(() => editor.rowCount === filtered.state.total || undefined, 5000, `filtered rows (${editor.rowCount})`);
+    console.log(`    search ${plain.ms.toFixed(0)} ms, filter ${filtered.ms.toFixed(0)} ms, ${filtered.state.total} lines`);
+    assert.equal(filtered.state.total, plain.state.total);
+    assert.ok(filtered.state.total >= 400_000, `expected ~500k lines, got ${filtered.state.total}`);
+    assert.ok(filtered.ms < 6000, `filter took ${filtered.ms} ms`);
+    assert.ok(filtered.ms < plain.ms * 1.5 + 300, `filter ${filtered.ms} ms vs search ${plain.ms} ms`);
+
+    const switches: Array<[FilterMode, number]> = [];
+    for (const mode of ['all', 'matches', 'nonMatches', 'all', 'matches'] as FilterMode[]) switches.push([mode, await setFilterMode(editor, mode)]);
+    console.log(`    switches: ${switches.map(([m, ms]) => `${m} ${ms.toFixed(0)} ms`).join(', ')}`);
+    assert.ok(Math.max(...switches.map(([, ms]) => ms)) < 500, 'switching is instant');
+    const mid = await editor.search.readView(filtered.state.searchId, 'matches', 250_000, 200);
+    for (const [k, text] of (mid?.lines ?? []).entries()) {
+      assert.match(text, re);
+      const { lines } = await doc.reader.readLines(mid?.lineNumbers[k] as number, 1);
+      assert.equal(lines[0], text);
+    }
+
+    const out = path.join(ROOT, 'test', '.tmp', 'it-export-1g.txt');
+    try {
+      const before = process.memoryUsage().rss;
+      const rss = new RssSampler();
+      const result = await vscode.commands.executeCommand<ExportResult | undefined>('bigview.exportFiltered', vscode.Uri.file(out));
+      const peak = rss.stop();
+      console.log(
+        `    export ${result?.lines} lines (${mb(result?.bytes ?? 0)}) in ${result?.elapsedMs.toFixed(0)} ms, ` +
+          `rss ${mb(before)} → peak ${mb(peak)} (+${mb(peak - before)})`,
+      );
+      assert.equal(result?.lines, filtered.state.total);
+      assert.ok(peak - before < 50 * MB, `export raised RSS by ${mb(peak - before)}`);
+
+      // Every exported line matches, and there are exactly as many as hits.
+      let count = 0;
+      const fd = fs.openSync(out, 'r');
+      const buf = Buffer.allocUnsafe(8 << 20);
+      let carry = '';
+      for (let pos = 0; ; ) {
+        const n = fs.readSync(fd, buf, 0, buf.length, pos);
+        if (n === 0) break;
+        pos += n;
+        const parts = (carry + buf.toString('latin1', 0, n)).split('\n');
+        carry = parts.pop() ?? '';
+        for (const line of parts) {
+          count++;
+          if (!re.test(line)) assert.fail(`exported line ${count} does not match: ${line.slice(0, 80)}`);
+        }
+      }
+      fs.closeSync(fd);
+      assert.equal(carry, '');
+      assert.equal(count, filtered.state.total);
+    } finally {
+      fs.rmSync(out, { force: true });
     }
   });
 }

@@ -29,6 +29,7 @@ const configs = [
     entryPoints: {
       'indexer.worker': 'src/workers/indexer.worker.ts',
       'search.worker': 'src/workers/search.worker.ts',
+      'export.worker': 'src/workers/export.worker.ts',
     },
     outdir: 'dist',
     platform: 'node',

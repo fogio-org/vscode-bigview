@@ -49,6 +49,21 @@
         "command": "bigview.findPrevious",
         "title": "Find Previous",
         "category": "BigView"
+      },
+      {
+        "command": "bigview.toggleFilter",
+        "title": "Toggle Filter (Show Only Matching Lines)",
+        "category": "BigView"
+      },
+      {
+        "command": "bigview.toggleInvert",
+        "title": "Invert Filter (Show Only Non-Matching Lines)",
+        "category": "BigView"
+      },
+      {
+        "command": "bigview.exportFiltered",
+        "title": "Export Filtered Lines",
+        "category": "BigView"
       }
     ],
     "keybindings": [
@@ -102,6 +117,18 @@
         },
         {
           "command": "bigview.findPrevious",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        },
+        {
+          "command": "bigview.toggleFilter",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        },
+        {
+          "command": "bigview.toggleInvert",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        },
+        {
+          "command": "bigview.exportFiltered",
           "when": "activeCustomEditorId == 'bigview.viewer'"
         }
       ],

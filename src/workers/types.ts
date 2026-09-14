@@ -59,8 +59,38 @@ export type SearchMessage =
       /** Matching line numbers since the previous message (transferred). */
       lines: Float64Array;
       bytesSearched: number;
+      /** Lines fully searched so far (every hit below it has been sent). */
+      linesSearched: number;
       fileSize: number;
     }
-  | { type: 'done'; id: number; lines: Float64Array; bytesSearched: number; fileSize: number; elapsedMs: number }
+  | {
+      type: 'done';
+      id: number;
+      lines: Float64Array;
+      bytesSearched: number;
+      /** Lines in the file. */
+      lineCount: number;
+      fileSize: number;
+      elapsedMs: number;
+    }
   | { type: 'cancelled'; id: number }
   | { type: 'error'; id: number; message: string; code?: string };
+
+export interface ExportWorkerData {
+  source: string;
+  target: string;
+  /** LineSet bitset words (transferred). */
+  words: Uint32Array;
+  /** Export the lines NOT in the bitset (within [0, lineCount)). */
+  invert: boolean;
+  lineCount: number;
+  cancel: SharedArrayBuffer;
+  chunkBytes?: number;
+  progressBytes?: number;
+}
+
+export type ExportMessage =
+  | { type: 'progress'; bytesRead: number; fileSize: number; linesWritten: number }
+  | { type: 'done'; linesWritten: number; bytesWritten: number; elapsedMs: number }
+  | { type: 'cancelled' }
+  | { type: 'error'; message: string; code?: string };

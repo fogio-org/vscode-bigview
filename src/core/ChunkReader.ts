@@ -83,6 +83,30 @@ export class ChunkReader {
     return result;
   }
 
+  /**
+   * Reads the given lines, e.g. the rows of a filtered view. Ascending lines share read blocks
+   * and skip forward from the previous line instead of seeking to an anchor. Stops at the first
+   * line that is not indexed yet; `result.lines[k]` is `targets[k]`.
+   */
+  async readLinesAt(targets: readonly number[]): Promise<LinesResult> {
+    const result: LinesResult = { start: 0, lines: [], truncated: [] };
+    const blocks = this.blocks();
+    let prevLine = -1;
+    let nextOffset = 0; // where prevLine + 1 starts
+    for (let k = 0; k < targets.length; k++) {
+      const line = targets[k] as number;
+      if (line >= this.index.lineCount) break;
+      const anchor = this.index.locate(line);
+      const pos =
+        prevLine >= 0 && line > prevLine && prevLine + 1 >= anchor.line
+          ? await this.skipLines(blocks, nextOffset, line - prevLine - 1)
+          : await this.skipLines(blocks, anchor.offset, line - anchor.line);
+      nextOffset = await this.readLineAt(blocks, pos, result, k);
+      prevLine = line;
+    }
+    return result;
+  }
+
   /** Byte offset where `line` starts. */
   async lineStart(line: number): Promise<number> {
     const anchor = this.index.locate(line);
@@ -104,8 +128,10 @@ export class ChunkReader {
 
   /** Offset after skipping `n` line terminators from `pos`. */
   private async skipLines(blocks: BlockCache, pos: number, n: number): Promise<number> {
+    // Start with a small read (usually a few lines away) and grow for long lines.
+    let want = Math.max(1, Math.min(this.blockBytes, this.scanBytes));
     while (n > 0) {
-      const view = await blocks.get(pos, this.scanBytes);
+      const view = await blocks.get(pos, want);
       if (view.length === 0) return blocks.limit;
       let i = -1;
       while (n > 0) {
@@ -115,18 +141,21 @@ export class ChunkReader {
       }
       if (n === 0) return pos + i + 1;
       pos += view.length;
+      want = Math.min(want * 2, Math.max(this.blockBytes, this.scanBytes));
     }
     return pos;
   }
 
   /** Offset of the next `\n` at or after `pos`, or -1. */
   private async findNewline(blocks: BlockCache, pos: number): Promise<number> {
+    let want = Math.max(1, Math.min(this.blockBytes, this.scanBytes));
     for (;;) {
-      const view = await blocks.get(pos, this.scanBytes);
+      const view = await blocks.get(pos, want);
       if (view.length === 0) return -1;
       const i = view.indexOf(10);
       if (i !== -1) return pos + i;
       pos += view.length;
+      want = Math.min(want * 2, Math.max(this.blockBytes, this.scanBytes));
     }
   }
 

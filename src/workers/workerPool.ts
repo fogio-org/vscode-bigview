@@ -2,7 +2,15 @@ import * as path from 'node:path';
 import { Worker, type ResourceLimits } from 'node:worker_threads';
 import type { LineIndex } from '../core/LineIndex';
 import type { SearchQuery } from '../shared/searchQuery';
-import type { IndexerMessage, IndexerWorkerData, SearchMessage, SearchRequest, SearchWorkerData } from './types';
+import type {
+  ExportMessage,
+  ExportWorkerData,
+  IndexerMessage,
+  IndexerWorkerData,
+  SearchMessage,
+  SearchRequest,
+  SearchWorkerData,
+} from './types';
 
 export type IndexOutcome =
   | { status: 'done'; fileSize: number; mtimeMs: number; elapsedMs: number }
@@ -27,9 +35,42 @@ export class IndexerError extends Error {
 /** Grace period for a cooperative cancel before the worker is terminated. */
 const CANCEL_GRACE_MS = 2000;
 
+/**
+ * Without a limit V8 lets the worker heap grow lazily: a regex search over 1 GB peaked at
+ * +155 MB RSS of collectable strings. Measured on 1 GB: 64/8 MB → +90 MB, 32/4 MB → +55 MB
+ * (~5% slower). Decoded pieces are ~1 MB; a long-line window decodes to at most 16 MB.
+ */
+export const SEARCH_WORKER_LIMITS: ResourceLimits = { maxOldGenerationSizeMb: 32, maxYoungGenerationSizeMb: 4 };
+
+export interface ExportRequest {
+  source: string;
+  target: string;
+  /** LineSet bitset words; transferred to the worker (unusable afterwards). */
+  words: Uint32Array;
+  invert: boolean;
+  lineCount: number;
+  chunkBytes?: number;
+  progressBytes?: number;
+}
+
+export type ExportOutcome =
+  | { status: 'done'; linesWritten: number; bytesWritten: number; elapsedMs: number }
+  | { status: 'cancelled' };
+
+export interface ExportTask {
+  readonly result: Promise<ExportOutcome>;
+  cancel(): void;
+}
+
+export class ExportError extends Error {
+  constructor(message: string, readonly code?: string) {
+    super(message);
+  }
+}
+
 /** Spawns and tracks worker threads. */
 export class WorkerPool {
-  private readonly active = new Set<IndexerTask>();
+  private readonly active = new Set<{ cancel(): void }>();
   private readonly searchWorkers = new Set<SearchWorker>();
 
   constructor(private readonly distDir: string) {}
@@ -105,6 +146,70 @@ export class WorkerPool {
     return task;
   }
 
+  /**
+   * Streams the lines selected by a bitset into `target` in a worker (SPEC §6 M4). A cancelled or
+   * failed export leaves no partial file behind.
+   */
+  exportLines(req: ExportRequest, onProgress: (bytesRead: number, fileSize: number, linesWritten: number) => void): ExportTask {
+    const cancelBuf = new SharedArrayBuffer(4);
+    const cancelFlag = new Int32Array(cancelBuf);
+    const workerData: ExportWorkerData = { ...req, cancel: cancelBuf };
+    const worker = new Worker(path.join(this.distDir, 'export.worker.js'), {
+      workerData,
+      transferList: [req.words.buffer as ArrayBuffer],
+      resourceLimits: SEARCH_WORKER_LIMITS,
+    });
+
+    let settled = false;
+    let killTimer: NodeJS.Timeout | undefined;
+
+    const result = new Promise<ExportOutcome>((resolve, reject) => {
+      const finish = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (killTimer) clearTimeout(killTimer);
+        this.active.delete(task);
+        fn();
+      };
+      worker.on('message', (msg: ExportMessage) => {
+        switch (msg.type) {
+          case 'progress':
+            if (!settled) onProgress(msg.bytesRead, msg.fileSize, msg.linesWritten);
+            break;
+          case 'done':
+            finish(() => resolve({ status: 'done', linesWritten: msg.linesWritten, bytesWritten: msg.bytesWritten, elapsedMs: msg.elapsedMs }));
+            break;
+          case 'cancelled':
+            finish(() => resolve({ status: 'cancelled' }));
+            break;
+          case 'error':
+            finish(() => reject(new ExportError(msg.message, msg.code)));
+            break;
+        }
+      });
+      worker.on('error', (err) => finish(() => reject(err)));
+      worker.on('exit', (code) =>
+        finish(() =>
+          Atomics.load(cancelFlag, 0) !== 0
+            ? resolve({ status: 'cancelled' })
+            : reject(new ExportError(`Export worker exited unexpectedly (code ${code})`)),
+        ),
+      );
+    });
+
+    const task: ExportTask = {
+      result,
+      cancel: () => {
+        if (settled) return;
+        Atomics.store(cancelFlag, 0, 1);
+        killTimer = setTimeout(() => void worker.terminate(), CANCEL_GRACE_MS);
+        killTimer.unref();
+      },
+    };
+    this.active.add(task);
+    return task;
+  }
+
   createSearchWorker(opts: SearchWorkerOptions = {}): SearchWorker {
     const worker = new SearchWorker(path.join(this.distDir, 'search.worker.js'), opts, () => this.searchWorkers.delete(worker));
     this.searchWorkers.add(worker);
@@ -118,12 +223,15 @@ export class WorkerPool {
 }
 
 export type SearchOutcome =
-  | { status: 'done'; bytesSearched: number; fileSize: number; elapsedMs: number }
+  | { status: 'done'; bytesSearched: number; lineCount: number; fileSize: number; elapsedMs: number }
   | { status: 'cancelled' };
 
 export interface SearchCallbacks {
-  /** New matching lines (ascending) and progress. Also called with the final batch. */
-  onProgress(lines: Float64Array, bytesSearched: number, fileSize: number): void;
+  /**
+   * New matching lines (ascending) and progress. `linesSearched`: every hit below it has been
+   * delivered. Also called with the final batch (then `linesSearched` = lines in the file).
+   */
+  onProgress(lines: Float64Array, bytesSearched: number, fileSize: number, linesSearched: number): void;
 }
 
 export interface SearchTask {
@@ -143,13 +251,6 @@ export interface SearchWorkerOptions {
   /** V8 heap limits of the worker thread; defaults to SEARCH_WORKER_LIMITS. */
   resourceLimits?: ResourceLimits;
 }
-
-/**
- * Without a limit V8 lets the worker heap grow lazily: a regex search over 1 GB peaked at
- * +155 MB RSS of collectable strings. Measured on 1 GB: 64/8 MB → +90 MB, 32/4 MB → +55 MB
- * (~5% slower). Decoded pieces are ~1 MB; a long-line window decodes to at most 16 MB.
- */
-export const SEARCH_WORKER_LIMITS: ResourceLimits = { maxOldGenerationSizeMb: 32, maxYoungGenerationSizeMb: 4 };
 
 export class SearchError extends Error {
   constructor(message: string, readonly code?: string) {
@@ -271,12 +372,18 @@ export class SearchWorker {
     if (!run || run.request.id !== msg.id) return;
     switch (msg.type) {
       case 'progress':
-        run.callbacks.onProgress(msg.lines, msg.bytesSearched, msg.fileSize);
+        run.callbacks.onProgress(msg.lines, msg.bytesSearched, msg.fileSize, msg.linesSearched);
         break;
       case 'done':
-        run.callbacks.onProgress(msg.lines, msg.bytesSearched, msg.fileSize);
+        run.callbacks.onProgress(msg.lines, msg.bytesSearched, msg.fileSize, msg.lineCount);
         this.current = undefined;
-        run.resolve({ status: 'done', bytesSearched: msg.bytesSearched, fileSize: msg.fileSize, elapsedMs: msg.elapsedMs });
+        run.resolve({
+          status: 'done',
+          bytesSearched: msg.bytesSearched,
+          lineCount: msg.lineCount,
+          fileSize: msg.fileSize,
+          elapsedMs: msg.elapsedMs,
+        });
         this.scheduleIdle();
         break;
       case 'cancelled':
