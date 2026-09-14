@@ -107,6 +107,25 @@ export class ChunkReader {
     return result;
   }
 
+  /** One line up to `maxBytes` (for detail views), cut at a character boundary. */
+  async readLineText(line: number, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
+    const start = await this.lineStart(line);
+    const available = Math.max(0, this.index.bytesIndexed - start);
+    const buf = await this.pool.read(this.filePath, start, Math.min(maxBytes + 4, available));
+    let e = buf.indexOf(10);
+    let truncated = false;
+    if (e === -1 ? buf.length > maxBytes : e > maxBytes) {
+      truncated = true;
+      e = maxBytes;
+      while (e > 0 && ((buf[e] as number) & 0xc0) === 0x80) e--;
+    } else if (e === -1) {
+      e = buf.length;
+    }
+    if (!truncated && e > 0 && buf[e - 1] === 0x0d) e--;
+    const s = start === 0 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf ? Math.min(3, e) : 0;
+    return { text: this.decoder.decode(buf.subarray(s, e)), truncated };
+  }
+
   /** Byte offset where `line` starts. */
   async lineStart(line: number): Promise<number> {
     const anchor = this.index.locate(line);

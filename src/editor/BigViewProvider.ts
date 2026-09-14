@@ -9,22 +9,34 @@ import { restoreLineIndex, type IndexStore } from '../core/IndexStore';
 import { LineIndex } from '../core/LineIndex';
 import { FREE_FILE_SIZE_LIMIT, isPro } from '../license';
 import type { IndexSource, IndexState, StatusInfo } from '../shared/format';
+import { detectFormat, type FormatChoice, type FormatInfo, type FormatKind } from '../shared/formats';
 import {
+  MAX_DETAIL_BYTES,
   MAX_LINES_PER_MESSAGE,
   type FilterMode,
   type HostToWebview,
   type WebviewCommand,
   type WebviewToHost,
 } from '../shared/protocol';
-import type { SearchQuery } from '../shared/searchQuery';
+import type { Query } from '../shared/searchQuery';
 import type { IndexOutcome, WorkerPool } from '../workers/workerPool';
 import { SearchController } from './SearchController';
+
+/** Remembers the format chosen by the user per file. */
+export interface FormatStore {
+  get(filePath: string): FormatChoice | undefined;
+  set(filePath: string, choice: FormatChoice | undefined): Thenable<void>;
+}
 
 export interface DocumentDeps {
   pool: FileHandlePool;
   workers: WorkerPool;
   store: IndexStore;
+  formats: FormatStore;
 }
+
+/** Lines sampled for format detection (SPEC §5 formats.ts). */
+const FORMAT_SAMPLE_LINES = 50;
 
 export class BigViewDocument implements vscode.CustomDocument {
   readonly index: LineIndex;
@@ -43,6 +55,10 @@ export class BigViewDocument implements vscode.CustomDocument {
   /** Resolves after a freshly built index was written to disk (or skipped / failed). */
   readonly persisted: Promise<void>;
   persistError: string | undefined;
+  /** Undefined until the first lines are available. */
+  format: FormatInfo | undefined;
+  private formatOverride: FormatChoice | undefined;
+  private formatGeneration = 0;
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChange = this.changeEmitter.event;
@@ -67,6 +83,7 @@ export class BigViewDocument implements vscode.CustomDocument {
     private readonly onDispose: () => void,
   ) {
     this.fileSize = fileSize;
+    this.formatOverride = deps.formats.get(uri.fsPath);
     this.index = cached ?? new LineIndex();
     this.source = cached ? 'cache' : 'scan';
     this.reader = new ChunkReader(deps.pool, uri.fsPath, this.index);
@@ -76,6 +93,7 @@ export class BigViewDocument implements vscode.CustomDocument {
       this.readyAt = performance.now();
       this.indexed = Promise.resolve();
       this.persisted = Promise.resolve();
+      void this.detectFormat();
       return;
     }
 
@@ -103,6 +121,7 @@ export class BigViewDocument implements vscode.CustomDocument {
     );
     this.indexed = outcome.then(() => undefined);
     this.persisted = outcome.then((o) => (o?.status === 'done' ? this.persist(o) : undefined));
+    void this.detectFormat();
   }
 
   get status(): StatusInfo {
@@ -122,6 +141,44 @@ export class BigViewDocument implements vscode.CustomDocument {
 
   createSearchWorker(): ReturnType<WorkerPool['createSearchWorker']> {
     return this.deps.workers.createSearchWorker();
+  }
+
+  /** Sets (or with undefined, clears) the user's format choice; remembered per file. */
+  async setFormat(choice: FormatChoice | undefined): Promise<FormatInfo | undefined> {
+    this.formatOverride = choice;
+    await this.deps.formats.set(this.uri.fsPath, choice);
+    await this.detectFormat();
+    return this.format;
+  }
+
+  private async detectFormat(): Promise<void> {
+    const generation = ++this.formatGeneration;
+    await this.waitForLines(FORMAT_SAMPLE_LINES);
+    let sample: string[] = [];
+    try {
+      sample = (await this.reader.readLines(0, FORMAT_SAMPLE_LINES)).lines;
+    } catch {
+      // unreadable: fall back to plain text
+    }
+    if (generation !== this.formatGeneration) return;
+    this.format = detectFormat(path.basename(this.uri.fsPath), sample, this.formatOverride);
+    this.changeEmitter.fire();
+  }
+
+  private waitForLines(count: number): Promise<void> {
+    return new Promise((resolve) => {
+      const ready = (): boolean => this.index.lineCount >= count || this.state !== 'indexing';
+      if (ready()) {
+        resolve();
+        return;
+      }
+      const sub = this.changeEmitter.event(() => {
+        if (ready()) {
+          sub.dispose();
+          resolve();
+        }
+      });
+    });
   }
 
   dispose(): void {
@@ -161,12 +218,14 @@ export interface BigViewEditor {
   /** Rows in the webview list and its filter mode, as last reported by the webview. */
   readonly rowCount: number;
   readonly viewMode: FilterMode;
+  /** Format the webview renders, as last reported. */
+  readonly viewFormat: FormatKind;
   /** Scrolls to and highlights a 0-based file line. */
   reveal(line: number): void;
   /** Forwards a keybinding command (find, find next/previous, filter toggles) to the webview. */
   runCommand(command: WebviewCommand): void;
   /** Types `query` into the webview search bar and runs it. */
-  setQuery(query: SearchQuery): void;
+  setQuery(query: Query): void;
   /** Switches the webview filter as if its buttons were used. */
   setFilterMode(mode: FilterMode): void;
   /** Handles a message as if it came from the webview (also used by integration tests). */
@@ -215,6 +274,7 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
 
     let ready = false;
     let pendingReveal: number | undefined;
+    let lastFormat: FormatInfo | undefined;
     const post = (msg: HostToWebview): void => {
       if (ready) void webview.postMessage(msg);
     };
@@ -228,6 +288,10 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
         source: doc.source,
       });
       if (doc.error) post({ type: 'error', message: doc.error });
+      if (ready && doc.format && doc.format !== lastFormat) {
+        lastFormat = doc.format;
+        post({ type: 'format', format: doc.format });
+      }
     };
 
     const viewportEmitter = new vscode.EventEmitter<void>();
@@ -244,18 +308,20 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
       visibleLines: 0,
       rowCount: 0,
       viewMode: 'all' as FilterMode,
+      viewFormat: 'text' as FormatKind,
       onDidChangeViewport: viewportEmitter.event,
       reveal: (line: number) => {
         if (ready) postReveal(line);
         else pendingReveal = line;
       },
       runCommand: (command: WebviewCommand) => post({ type: 'command', command }),
-      setQuery: (query: SearchQuery) => post({ type: 'setQuery', query }),
+      setQuery: (query: Query) => post({ type: 'setQuery', query }),
       setFilterMode: (mode: FilterMode) => post({ type: 'setFilterMode', mode }),
       dispatch: (msg: WebviewToHost) => {
         switch (msg.type) {
           case 'ready':
             ready = true; // (re)sent whenever the webview (re)loads
+            lastFormat = undefined;
             search.reset();
             post({ type: 'init', fileName: path.basename(doc.uri.fsPath), fileSize: doc.fileSize });
             postState();
@@ -282,10 +348,18 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
             editor.visibleLines = msg.visibleLines;
             editor.rowCount = msg.rowCount;
             editor.viewMode = msg.mode;
+            editor.viewFormat = msg.format;
             viewportEmitter.fire();
             break;
           case 'search':
             search.start(msg.searchId, msg.query, msg.mode);
+            break;
+          case 'getLineText':
+            doc.reader.readLineText(msg.line, MAX_DETAIL_BYTES).then(
+              (r) => post({ type: 'lineText', reqId: msg.reqId, line: msg.line, text: r.text, truncated: r.truncated }),
+              (err: unknown) =>
+                post({ type: 'lineText', reqId: msg.reqId, line: msg.line, text: '', truncated: false, error: String(err) }),
+            );
             break;
           case 'setFilter':
             search.setFilter(msg.searchId, msg.viewId, msg.mode, msg.anchorIndex);

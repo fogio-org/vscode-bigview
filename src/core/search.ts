@@ -9,11 +9,15 @@
  * be missed, and `^`/`$` also match at window edges.
  *
  * Case-sensitive literal queries are matched on raw bytes with Buffer.indexOf. Everything else
- * decodes the chunk once and runs the regex over it (see RegexMatcher).
+ * decodes the chunk (in pieces) and tests lines: regexes (see RegexMatcher), the log time range
+ * and the JSON field filter (SPEC §6 M5).
  *
  * A hit is a line: each matching line is reported once, in ascending order.
  */
-import { compileQuery, literalNeedle, type SearchQuery } from '../shared/searchQuery';
+import { matchFieldLine, type FieldFilter } from '../formats/jsonlFormat';
+import { parseTimestamp } from '../formats/logFormat';
+import { compileFieldQuery, compileTimeRange, type TimeRange } from '../formats/predicates';
+import { compileQuery, isTextQuery, literalNeedle, type Query } from '../shared/searchQuery';
 
 export const SEARCH_CHUNK_BYTES = 8 * 1024 * 1024;
 export const SEARCH_OVERLAP_BYTES = 4 * 1024;
@@ -57,13 +61,17 @@ export interface LineMatcher {
   /**
    * Scans `region`, which holds whole lines (each ends with `\n`, except possibly the last one
    * at EOF). Calls `hit` for matching lines and returns the number of lines in the region.
+   * Regions arrive in file order, so matchers may carry state from line to line.
    */
   scanLines(region: Buffer, firstLine: number, atFileStart: boolean, hit: (line: number) => void): number;
-  /** Whether a piece of a single line (no `\n`) contains a match. */
+  /** Whether a piece of a single line (no `\n`) matches. */
   testFragment(fragment: Buffer, atLineEnd: boolean): boolean;
 }
 
-export function createMatcher(query: SearchQuery): LineMatcher {
+export function createMatcher(query: Query): LineMatcher {
+  if (!isTextQuery(query)) {
+    return query.kind === 'time' ? new TimeRangeMatcher(compileTimeRange(query)) : new FieldMatcher(compileFieldQuery(query));
+  }
   const compiled = compileQuery(query); // validates every query, including literals
   const needle = literalNeedle(query);
   return needle !== undefined ? new ByteMatcher(Buffer.from(needle, 'utf8')) : new RegexMatcher(compiled.regex, compiled.lineLocal);
@@ -103,60 +111,76 @@ class ByteMatcher implements LineMatcher {
   }
 }
 
-/**
- * Decodes a region once and finds matching lines.
- *
- * Line-local patterns run as one global multiline scan: the leftmost match jumps straight to
- * the next candidate line. A match that ends past its line (e.g. `a\s+b` across `\n`) is
- * re-checked against that line alone. Patterns with lookarounds can depend on text beyond the
- * line, so they are tested line by line.
- */
-class RegexMatcher implements LineMatcher {
+/** Decodes regions and tests each line with `test`. */
+abstract class PerLineMatcher implements LineMatcher {
   readonly decodes = true;
   private readonly decoder = new TextDecoder('utf-8', { ignoreBOM: true });
-  private readonly global: RegExp;
 
-  constructor(
-    private readonly line: RegExp,
-    private readonly lineLocal: boolean,
-  ) {
-    this.global = new RegExp(line.source, `${line.flags}gm`);
-  }
+  protected abstract test(line: string): boolean;
 
   scanLines(region: Buffer, firstLine: number, atFileStart: boolean, hit: (line: number) => void): number {
     if (region.length === 0) return 0;
+    const s = this.decodeRegion(region, atFileStart);
+    if (s.length === 0) {
+      // A single empty line (e.g. only a BOM or `\r` before EOF).
+      if (this.test('')) hit(firstLine);
+      return 1;
+    }
+    return this.scan(s, firstLine, hit);
+  }
+
+  testFragment(fragment: Buffer, atLineEnd: boolean): boolean {
+    let s = this.decoder.decode(fragment);
+    if (atLineEnd && s.endsWith('\r')) s = s.slice(0, -1);
+    return this.test(s);
+  }
+
+  /** Decoded region with the BOM removed and `\r\n` turned into `\n`. */
+  protected decodeRegion(region: Buffer, atFileStart: boolean): string {
     let s = this.decoder.decode(region);
     if (atFileStart && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
     if (s.includes('\r')) {
       s = s.replace(/\r\n/g, '\n');
       if (s.endsWith('\r')) s = s.slice(0, -1);
     }
-    if (s.length === 0) {
-      // A single empty line (e.g. only a BOM or `\r` before EOF).
-      if (this.line.test('')) hit(firstLine);
-      return 1;
-    }
-    return this.lineLocal ? this.scanGlobal(s, firstLine, hit) : this.scanEach(s, firstLine, hit);
+    return s;
   }
 
-  testFragment(fragment: Buffer, atLineEnd: boolean): boolean {
-    let s = this.decoder.decode(fragment);
-    if (atLineEnd && s.endsWith('\r')) s = s.slice(0, -1);
-    return this.line.test(s);
-  }
-
-  private scanEach(s: string, firstLine: number, hit: (line: number) => void): number {
+  protected scan(s: string, firstLine: number, hit: (line: number) => void): number {
     let line = firstLine;
     for (let ls = 0; ls < s.length; line++) {
       let le = s.indexOf('\n', ls);
       if (le === -1) le = s.length;
-      if (this.line.test(s.slice(ls, le))) hit(line);
+      if (this.test(s.slice(ls, le))) hit(line);
       ls = le + 1;
     }
     return line - firstLine;
   }
+}
 
-  private scanGlobal(s: string, firstLine: number, hit: (line: number) => void): number {
+/**
+ * Line-local patterns run as one global multiline scan: the leftmost match jumps straight to
+ * the next candidate line. A match that ends past its line (e.g. `a\s+b` across `\n`) is
+ * re-checked against that line alone. Patterns with lookarounds can depend on text beyond the
+ * line, so they are tested line by line.
+ */
+class RegexMatcher extends PerLineMatcher {
+  private readonly global: RegExp;
+
+  constructor(
+    private readonly line: RegExp,
+    private readonly lineLocal: boolean,
+  ) {
+    super();
+    this.global = new RegExp(line.source, `${line.flags}gm`);
+  }
+
+  protected test(text: string): boolean {
+    return this.line.test(text);
+  }
+
+  protected override scan(s: string, firstLine: number, hit: (line: number) => void): number {
+    if (!this.lineLocal) return super.scan(s, firstLine, hit);
     const re = this.global;
     const n = s.length;
     let line = firstLine;
@@ -186,10 +210,37 @@ class RegexMatcher implements LineMatcher {
   }
 }
 
+/** Lines without a timestamp inherit the last one seen above them. */
+class TimeRangeMatcher extends PerLineMatcher {
+  private last: number | undefined;
+  private readonly year = new Date().getUTCFullYear();
+
+  constructor(private readonly range: TimeRange) {
+    super();
+  }
+
+  protected test(line: string): boolean {
+    const ts = parseTimestamp(line, this.year);
+    if (ts) this.last = ts.ms;
+    const t = this.last;
+    return t !== undefined && (this.range.from === undefined || t >= this.range.from) && (this.range.to === undefined || t <= this.range.to);
+  }
+}
+
+class FieldMatcher extends PerLineMatcher {
+  constructor(private readonly filter: FieldFilter) {
+    super();
+  }
+
+  protected test(line: string): boolean {
+    return matchFieldLine(line, this.filter);
+  }
+}
+
 export function searchFile(
   read: ReadFn,
   fileSize: number,
-  query: SearchQuery,
+  query: Query,
   sink: SearchSink,
   opts: SearchOptions = {},
 ): SearchSummary {

@@ -15,13 +15,26 @@
 import type { Range } from '../src/shared/searchQuery';
 import { clamp, positionForThumbOffset, thumbGeometry, type ThumbGeometry } from './scrollMath';
 
+/** A styled span of a row's text. Marks may overlap. */
+export interface Mark {
+  start: number;
+  end: number;
+  cls: string;
+}
+
 export interface RowData {
   text: string;
   truncated?: boolean;
-  /** Highlighted ranges of `text` (UTF-16 offsets, ascending, non-overlapping). */
+  /** Search match ranges of `text` (UTF-16 offsets, ascending, non-overlapping). */
   ranges?: readonly Range[];
   /** Text was cut at the start: show an ellipsis. */
   cutStart?: boolean;
+  /** Extra class of the row (e.g. log level). */
+  cls?: string;
+  /** Format decorations (e.g. log timestamp). */
+  marks?: readonly Mark[];
+  /** Table cells: rendered instead of `text` when the list has cell widths. */
+  cells?: readonly string[];
 }
 
 export interface VirtualListOptions {
@@ -37,7 +50,14 @@ export interface VirtualListOptions {
   className?: string;
   /** Focus the list when created. Default true. */
   autoFocus?: boolean;
+  /** Table mode: widths of the cells of `RowData.cells`, px. */
+  cellWidths?(): readonly number[] | undefined;
+  /** Overrides the scrollable content width (px) computed from text length. */
+  contentWidth?(): number | undefined;
+  onHorizontalScroll?(left: number): void;
 }
+
+const DEFAULT_CELL_PX = 120;
 
 const BUFFER_ROWS = 50;
 const SCROLLBAR_PX = 14;
@@ -87,6 +107,7 @@ export class VirtualList {
   private hbarVisible = false;
   private drag: Drag | undefined;
   private frame = 0;
+  private reportedLeft = -1;
 
   constructor(private readonly opts: VirtualListOptions) {
     this.root = el('div', opts.className ? `vl ${opts.className}` : 'vl');
@@ -196,6 +217,25 @@ export class VirtualList {
     this.view.focus({ preventScroll: true });
   }
 
+  /** Width of the line-number gutter, px. */
+  get gutterPixels(): number {
+    return this.gutterWidth;
+  }
+
+  /** Width of one monospace character, px. */
+  get charPixels(): number {
+    return this.charWidth;
+  }
+
+  get horizontalScroll(): number {
+    return this.scrollLeft;
+  }
+
+  /** Recomputes sizes (e.g. after table column widths changed). */
+  relayout(): void {
+    this.layout();
+  }
+
   // ---- geometry ----
 
   private get gutterWidth(): number {
@@ -215,7 +255,7 @@ export class VirtualList {
   }
 
   private get contentWidth(): number {
-    return Math.ceil(this.maxLineChars * this.charWidth) + TEXT_PADDING_PX * 2;
+    return this.opts.contentWidth?.() ?? Math.ceil(this.maxLineChars * this.charWidth) + TEXT_PADDING_PX * 2;
   }
 
   private get maxScrollLeft(): number {
@@ -408,7 +448,7 @@ export class VirtualList {
       }
       if (row.data !== data) {
         row.gutter.textContent = this.opts.gutterText ? this.opts.gutterText(index) : String(index + 1);
-        renderText(row.text, data);
+        renderRow(row.text, data, this.opts.cellWidths?.());
         row.data = data;
         if (data && data.text.length > widest) widest = data.text.length;
       }
@@ -422,6 +462,10 @@ export class VirtualList {
     const offsetY = start * lh - this.virtualTop;
     this.gutterLayer.style.transform = `translate3d(0, ${offsetY}px, 0)`;
     this.textLayer.style.transform = `translate3d(${-this.scrollLeft}px, ${offsetY}px, 0)`;
+    if (this.scrollLeft !== this.reportedLeft) {
+      this.reportedLeft = this.scrollLeft;
+      this.opts.onHorizontalScroll?.(this.scrollLeft);
+    }
 
     const hy = this.highlightIndex * lh - this.virtualTop;
     const showHighlight = this.highlightIndex >= 0 && this.highlightIndex < this.count && hy > -lh && hy < this.viewHeight;
@@ -454,25 +498,46 @@ export class VirtualList {
   }
 }
 
-function renderText(node: HTMLDivElement, data: RowData | undefined): void {
-  const text = data?.text ?? '';
-  const ranges = data?.ranges;
-  node.textContent = data?.cutStart ? '…' : '';
-  if (!ranges || ranges.length === 0) {
-    node.append(text);
-  } else {
-    let pos = 0;
-    for (const [s, e] of ranges) {
-      if (s < pos || e <= s) continue;
-      if (s > pos) node.append(text.slice(pos, s));
-      const mark = el('span', 'vl-match');
-      mark.textContent = text.slice(s, e);
-      node.append(mark);
-      pos = e;
-    }
-    if (pos < text.length) node.append(text.slice(pos));
+function renderRow(node: HTMLDivElement, data: RowData | undefined, cellWidths: readonly number[] | undefined): void {
+  node.className = `vl-row${data?.cls ? ` ${data.cls}` : ''}${data?.truncated ? ' truncated' : ''}`;
+  node.textContent = '';
+  if (data?.cells && cellWidths) {
+    data.cells.forEach((cell, i) => {
+      const span = el('span', 'vl-cell');
+      span.style.width = `${cellWidths[i] ?? DEFAULT_CELL_PX}px`;
+      span.textContent = cell;
+      node.append(span);
+    });
+    return;
   }
-  node.classList.toggle('truncated', data?.truncated ?? false);
+  const text = data?.text ?? '';
+  if (data?.cutStart) node.append('…');
+  const marks: Mark[] = [];
+  for (const [start, end] of data?.ranges ?? []) marks.push({ start, end, cls: 'vl-match' });
+  if (data?.marks) marks.push(...data.marks);
+  if (marks.length === 0) {
+    node.append(text);
+    return;
+  }
+  // Split at every mark boundary; each piece gets the classes of the marks covering it.
+  const cuts = new Set<number>([0, text.length]);
+  for (const m of marks) {
+    cuts.add(clamp(m.start, 0, text.length));
+    cuts.add(clamp(m.end, 0, text.length));
+  }
+  const points = [...cuts].sort((a, b) => a - b);
+  for (let k = 0; k + 1 < points.length; k++) {
+    const a = points[k] as number;
+    const b = points[k + 1] as number;
+    const classes = marks.filter((m) => m.start <= a && m.end >= b).map((m) => m.cls);
+    if (classes.length === 0) {
+      node.append(text.slice(a, b));
+    } else {
+      const span = el('span', classes.join(' '));
+      span.textContent = text.slice(a, b);
+      node.append(span);
+    }
+  }
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): HTMLElementTagNameMap[K] {

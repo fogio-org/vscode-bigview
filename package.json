@@ -64,6 +64,11 @@
         "command": "bigview.exportFiltered",
         "title": "Export Filtered Lines",
         "category": "BigView"
+      },
+      {
+        "command": "bigview.changeFormat",
+        "title": "Change Format...",
+        "category": "BigView"
       }
     ],
     "keybindings": [
@@ -129,6 +134,10 @@
         },
         {
           "command": "bigview.exportFiltered",
+          "when": "activeCustomEditorId == 'bigview.viewer'"
+        },
+        {
+          "command": "bigview.changeFormat",
           "when": "activeCustomEditorId == 'bigview.viewer'"
         }
       ],

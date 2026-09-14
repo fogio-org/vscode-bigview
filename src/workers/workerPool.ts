@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import { Worker, type ResourceLimits } from 'node:worker_threads';
 import type { LineIndex } from '../core/LineIndex';
-import type { SearchQuery } from '../shared/searchQuery';
+import type { Query } from '../shared/searchQuery';
 import type {
   ExportMessage,
   ExportWorkerData,
@@ -301,7 +301,7 @@ export class SearchWorker {
     return this.worker !== undefined;
   }
 
-  search(filePath: string, query: SearchQuery, callbacks: SearchCallbacks): SearchTask {
+  search(filePath: string, query: Query, callbacks: SearchCallbacks): SearchTask {
     if (this.disposed) throw new Error('SearchWorker is disposed');
     this.cancelCurrent();
     const id = this.nextId++;

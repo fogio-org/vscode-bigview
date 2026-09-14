@@ -11,7 +11,8 @@ import type { SearchState } from '../../src/editor/SearchController';
 import type { BigViewApi, ExportResult } from '../../src/extension';
 import { formatCount } from '../../src/shared/format';
 import type { FilterMode, HitTarget } from '../../src/shared/protocol';
-import { compileQuery, type SearchQuery } from '../../src/shared/searchQuery';
+import type { FormatInfo } from '../../src/shared/formats';
+import { compileQuery, type Query, type SearchQuery } from '../../src/shared/searchQuery';
 import type { GenerateResult } from '../fixtures/generate';
 import { enabledTiers, FIXTURES, loadFixture, type FixtureSpec } from './fixtures';
 
@@ -250,12 +251,17 @@ test('status bar shows size, line count and index state', async () => {
 
 type QueryInput = Partial<SearchQuery> & { text: string };
 
-const sameQuery = (a: SearchQuery | undefined, b: SearchQuery): boolean =>
-  !!a && a.text === b.text && a.caseSensitive === b.caseSensitive && a.wholeWord === b.wholeWord && a.regex === b.regex;
+/** Key-order independent comparison of flat query objects. */
+const sameQuery = (a: Query | undefined, b: Query): boolean =>
+  !!a && JSON.stringify(a, Object.keys(a).sort()) === JSON.stringify(b, Object.keys(b).sort());
 
-/** Types the query into the webview search bar (real webview path) and waits for the result. */
+/** Types a text query into the webview search bar (real webview path) and waits for the result. */
 async function runSearch(editor: BigViewEditor, input: QueryInput, timeoutMs = 30_000): Promise<{ state: SearchState; ms: number }> {
-  const query: SearchQuery = { caseSensitive: true, wholeWord: false, regex: false, ...input };
+  return runQuery(editor, { caseSensitive: true, wholeWord: false, regex: false, ...input }, timeoutMs);
+}
+
+/** Runs any query (text, time range, field) through the webview search bar. */
+async function runQuery(editor: BigViewEditor, query: Query, timeoutMs = 30_000): Promise<{ state: SearchState; ms: number }> {
   const before = editor.search.state.searchId;
   const t0 = performance.now();
   editor.setQuery(query);
@@ -355,7 +361,7 @@ test('a new query replaces the running search; an invalid regex reports an error
     editor.setQuery({ text: '\\w+\\s+\\w+\\s+\\w+\\s+NOPE', caseSensitive: true, wholeWord: false, regex: true });
     const { state } = await runSearch(editor, { text: 'NEEDLE_MARKER' });
     assert.equal(state.total, gen.markerLines);
-    const firstId = seen.find((s) => s.query?.text.endsWith('NOPE'))?.searchId;
+    const firstId = seen.find((s) => s.query && 'text' in s.query && s.query.text.endsWith('NOPE'))?.searchId;
     assert.ok(firstId !== undefined, 'the first search started');
     let lastOfFirst = -1;
     seen.forEach((s, i) => {
@@ -483,6 +489,96 @@ test('export writes exactly the selected lines, for a filter and its inverse', a
     fs.rmSync(matchesOut, { force: true });
     fs.rmSync(invertOut, { force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Formats (M5)
+
+test('formats are detected per file: log, JSON Lines (by extension and by content), CSV', async () => {
+  const cases: Array<[FixtureSpec, FormatInfo]> = [
+    [FIXTURES.small, { kind: 'log', source: 'extension' }],
+    [FIXTURES.jsonl, { kind: 'jsonl', source: 'extension' }],
+    [FIXTURES.jsonLog, { kind: 'jsonl', source: 'content' }],
+    [FIXTURES.csv, { kind: 'dsv', delimiter: ',', source: 'extension', header: ['id', 'ts', 'level', 'user', 'message'] }],
+  ];
+  const { statusBar } = await api();
+  for (const [spec, expected] of cases) {
+    const { doc, editor } = await open(fixture(spec));
+    const format = await waitFor(() => doc.format, 5000, `format of ${spec.name}`);
+    assert.deepEqual(format, expected, spec.name);
+    await waitFor(() => editor.viewFormat === expected.kind || undefined, 5000, `webview renders ${expected.kind} (${editor.viewFormat})`);
+    assert.ok(statusBar.formatText.length > 0, 'format shown in the status bar');
+    await closeAll();
+  }
+});
+
+test('the format can be switched manually and is remembered per file', async () => {
+  const gen = fixture(FIXTURES.csv);
+  let { doc, editor } = await open(gen);
+  await waitFor(() => doc.format, 5000, 'format');
+
+  let f = await vscode.commands.executeCommand<FormatInfo | undefined>('bigview.changeFormat', { kind: 'dsv', delimiter: '\t' });
+  assert.deepEqual(f, { kind: 'dsv', delimiter: '\t', source: 'user', header: ['id,ts,level,user,message'] });
+  f = await vscode.commands.executeCommand<FormatInfo | undefined>('bigview.changeFormat', 'text');
+  assert.deepEqual(f, { kind: 'text', source: 'user' });
+  await waitFor(() => editor.viewFormat === 'text' || undefined, 5000, `webview text (${editor.viewFormat})`);
+
+  await closeAll();
+  ({ doc, editor } = await open(gen));
+  const remembered = await waitFor(() => doc.format, 5000, 'format after reopening');
+  assert.deepEqual(remembered, { kind: 'text', source: 'user' });
+
+  f = await vscode.commands.executeCommand<FormatInfo | undefined>('bigview.changeFormat', 'auto');
+  assert.equal(f?.kind, 'dsv');
+  assert.equal(f?.source, 'extension');
+  await waitFor(() => editor.viewFormat === 'dsv' || undefined, 5000, `webview dsv (${editor.viewFormat})`);
+});
+
+test('log: the time range filter selects lines by timestamp (bounds inclusive of their unit)', async () => {
+  const gen = fixture(FIXTURES.small);
+  const { editor } = await open(gen);
+  await waitFor(() => editor.viewFormat === 'log' || undefined, 5000, 'log view');
+  const times = fileLines(gen.path).map((t) => Date.parse(t.slice(0, 24)));
+  const expect = (from: number, to: number): number[] => times.flatMap((ms, i) => (ms >= from && ms <= to ? [i] : []));
+
+  const a = await runQuery(editor, { kind: 'time', from: '2026-01-01T00:01:00Z', to: '2026-01-01T00:02:30.500Z' });
+  assert.equal(a.state.status, 'done', a.state.error);
+  assert.deepEqual(editor.search.hitLines(), expect(Date.parse('2026-01-01T00:01:00Z'), Date.parse('2026-01-01T00:02:30.500Z')));
+
+  const b = await runQuery(editor, { kind: 'time', from: '', to: '2026-01-01 00:00' });
+  assert.deepEqual(editor.search.hitLines(), expect(-Infinity, Date.parse('2026-01-01T00:00:59.999Z')));
+  console.log(`    time range: ${a.state.total} lines in ${a.ms.toFixed(0)} ms, ${b.state.total} lines in ${b.ms.toFixed(0)} ms`);
+
+  // Predicates plug into the filter view like any search.
+  await setFilterMode(editor, 'matches');
+  assert.equal(editor.rowCount, b.state.total);
+
+  const bad = await runQuery(editor, { kind: 'time', from: 'soon', to: '' });
+  assert.equal(bad.state.status, 'error');
+});
+
+test('JSON Lines: field filters match a JSON.parse reference', async () => {
+  const gen = fixture(FIXTURES.jsonl);
+  const { editor } = await open(gen);
+  await waitFor(() => editor.viewFormat === 'jsonl' || undefined, 5000, 'jsonl view');
+  const objects = fileLines(gen.path).map((t) => JSON.parse(t) as Record<string, string>);
+  const cases: Array<[string, (o: Record<string, string>) => boolean]> = [
+    ['level=error', (o) => o.level === 'error'],
+    ['msg~NEEDLE_MARKER', (o) => /NEEDLE_MARKER/.test(o.msg ?? '')],
+    ['trace_id~^0[0-3]', (o) => /^0[0-3]/.test(o.trace_id ?? '')],
+    ['level = "warn"', (o) => o.level === 'warn'],
+    ['msg~/ЗАПРОС/i', (o) => /запрос/i.test(o.msg ?? '')],
+  ];
+  for (const [expression, predicate] of cases) {
+    const { state, ms } = await runQuery(editor, { kind: 'field', expression });
+    assert.equal(state.status, 'done', state.error);
+    assert.deepEqual(editor.search.hitLines(), objects.flatMap((o, i) => (predicate(o) ? [i] : [])), expression);
+    console.log(`    ${expression}: ${state.total} lines in ${ms.toFixed(0)} ms`);
+  }
+  const marker = await runQuery(editor, { kind: 'field', expression: 'msg~NEEDLE_MARKER' });
+  assert.equal(marker.state.total, gen.markerLines);
+  const bad = await runQuery(editor, { kind: 'field', expression: 'level' });
+  assert.equal(bad.state.status, 'error');
 });
 
 if (TIERS.has('large')) {

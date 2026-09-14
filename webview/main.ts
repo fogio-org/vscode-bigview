@@ -1,9 +1,13 @@
+import { parseDsvLine } from '../src/formats/dsvFormat';
+import { fieldValueText, flattenJson, parseJsonLine, type JsonValue } from '../src/formats/jsonlFormat';
+import { detectLevel, parseTimestamp } from '../src/formats/logFormat';
 import { formatBytes, formatCount } from '../src/shared/format';
+import { formatLabel, type FormatInfo } from '../src/shared/formats';
 import type { FilterMode, HitTarget, HostToWebview, SearchResultItem, WebviewToHost } from '../src/shared/protocol';
-import { compileQuery, findRanges, type SearchQuery } from '../src/shared/searchQuery';
+import { compileQuery, findRanges, isEmptyQuery, isTextQuery, type Query } from '../src/shared/searchQuery';
 import { SearchBar } from './SearchBar';
 import './styles.css';
-import { VirtualList, type RowData } from './VirtualList';
+import { VirtualList, type Mark, type RowData } from './VirtualList';
 
 interface VsCodeApi {
   postMessage(msg: WebviewToHost): void;
@@ -14,15 +18,17 @@ declare function acquireVsCodeApi(): VsCodeApi;
 
 interface SavedState {
   topLine: number;
-  query?: SearchQuery;
+  query?: Query;
   resultsHeight?: number;
   filterMode?: FilterMode;
+  /** DSV column widths by header signature. */
+  columns?: { key: string; widths: number[] };
 }
 
 interface CachedLine extends RowData {
   /** File line shown in the row. */
   lineNumber: number;
-  /** searchVersion the highlight ranges were computed for. */
+  /** decorVersion the decorations were computed for. */
   v: number;
 }
 
@@ -38,6 +44,12 @@ const MAX_CACHED_RESULTS = 5_000;
 const REQUEST_RETRY_MS = 10_000;
 const VIEWPORT_POST_MS = 100;
 const MIN_RESULTS_PX = 60;
+const MIN_COLUMN_PX = 40;
+const MIN_AUTO_COLUMN_PX = 60;
+const MAX_AUTO_COLUMN_PX = 420;
+const DETAIL_FIELDS = 500;
+const DETAIL_JSON_CHARS = 200_000;
+const YEAR = new Date().getUTCFullYear();
 
 const vscode = acquireVsCodeApi();
 const saved: SavedState = { topLine: 0, ...(vscode.getState() as Partial<SavedState> | undefined) };
@@ -52,6 +64,9 @@ const progressBarEl = $('progress-bar');
 const errorEl = $('error');
 const splitterEl = $('results-splitter');
 const resultsEl = $('results');
+const tableHeaderEl = $('table-header');
+const tableCellsEl = $('table-header-cells');
+const detailsEl = $('details');
 
 /** Main list rows by row index (file lines, or filtered rows). */
 const lineCache = new Map<number, CachedLine>();
@@ -60,20 +75,22 @@ const resultCache = new Map<number, SearchResultItem>();
 const pendingResultBlocks = new Map<number, number>();
 let reqSeq = 0;
 let lineCount = 0;
+let fileSize = 0;
 let indexInfo: IndexMessage | undefined;
 let viewportTimer = 0;
 
 let searchId = 0;
 let searchState: SearchStateMessage | undefined;
 let searchRegex: RegExp | undefined;
-let searchVersion = 0;
+/** Bumped when highlights or format decorations must be recomputed. */
+let decorVersion = 0;
 let currentHit = -1;
 let currentHitLine = -1;
 /** Jump to the first hit once the new search produces one. */
 let autoJump = false;
 
 /** What the main list shows. Rows of a filtered view come from the host with their line numbers. */
-let viewMode: FilterMode = saved.query?.text ? (saved.filterMode ?? 'all') : 'all';
+let viewMode: FilterMode = saved.query && !isEmptyQuery(saved.query) ? (saved.filterMode ?? 'all') : 'all';
 /** Changes whenever the rows change meaning; responses for older views are dropped. */
 let viewId = 1;
 let viewCount = 0;
@@ -81,7 +98,14 @@ let viewCount = 0;
 let pendingFilter: FilterMode | undefined;
 let restoreLine = viewMode === 'all' ? saved.topLine : 0;
 
+let format: FormatInfo = { kind: 'text', source: 'content' };
+let columnWidths: number[] = [];
+/** Columns still use their initial width and may be sized from loaded rows. */
+let columnsAutoSize = false;
+let detailRequest = 0;
+
 const rowCount = (): number => (viewMode === 'all' ? lineCount : viewCount);
+const hasQuery = (): boolean => !isEmptyQuery(bar.value);
 
 function post(msg: WebviewToHost): void {
   vscode.postMessage(msg);
@@ -89,6 +113,12 @@ function post(msg: WebviewToHost): void {
 
 function saveState(): void {
   vscode.setState(saved);
+}
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  node.className = className;
+  return node;
 }
 
 function requestBlocks(
@@ -126,13 +156,39 @@ function evict<T>(cache: Map<number, T>, max: number, center: number, radius: nu
   }
 }
 
+/** Search highlights and format decorations of a row (computed once per decorVersion). */
+function decorate(entry: CachedLine): void {
+  entry.ranges = searchRegex ? findRanges(entry.text, searchRegex) : undefined;
+  entry.cls = undefined;
+  entry.marks = undefined;
+  entry.cells = undefined;
+  switch (format.kind) {
+    case 'log': {
+      const marks: Mark[] = [];
+      const level = detectLevel(entry.text);
+      if (level) {
+        entry.cls = `lvl-${level.level}`;
+        marks.push({ start: level.start, end: level.end, cls: 'log-level' });
+      }
+      const ts = parseTimestamp(entry.text, YEAR);
+      if (ts) marks.push({ start: ts.start, end: ts.end, cls: 'log-ts' });
+      entry.marks = marks;
+      break;
+    }
+    case 'dsv':
+      entry.cells = parseDsvLine(entry.text, format.delimiter ?? ',');
+      if (entry.lineNumber === 0) entry.cls = 'dsv-header-row';
+      break;
+    default:
+      break;
+  }
+  entry.v = decorVersion;
+}
+
 function lineRow(row: number): RowData | undefined {
   const entry = lineCache.get(row);
   if (!entry) return undefined;
-  if (entry.v !== searchVersion) {
-    entry.ranges = searchRegex ? findRanges(entry.text, searchRegex) : undefined;
-    entry.v = searchVersion;
-  }
+  if (entry.v !== decorVersion) decorate(entry);
   return entry;
 }
 
@@ -156,6 +212,12 @@ const list = new VirtualList({
     saved.topLine = topLine;
     saveState();
     scheduleViewport();
+  },
+  onRowClick: (row) => showDetails(row),
+  cellWidths: () => (format.kind === 'dsv' ? columnWidths : undefined),
+  contentWidth: () => (format.kind === 'dsv' ? columnWidths.reduce((a, b) => a + b + 8, 0) + 48 : undefined),
+  onHorizontalScroll: (left) => {
+    tableCellsEl.style.transform = `translate3d(${-left}px, 0, 0)`;
   },
 });
 
@@ -182,7 +244,7 @@ const bar = new SearchBar($('search-bar'), saved.query, {
   onEscape: () => list.focus(),
   onFilter: (mode) => requestFilter(mode),
 });
-bar.setFilter(viewMode, Boolean(saved.query?.text));
+bar.setFilter(viewMode, Boolean(saved.query && !isEmptyQuery(saved.query)));
 
 /**
  * Reports the viewport to the host: throttled while scrolling, immediately after discrete changes
@@ -203,7 +265,14 @@ function scheduleViewport(immediate = false): void {
 }
 
 function postViewport(): void {
-  post({ type: 'viewport', topLine: list.topLine, visibleLines: list.visibleLines, rowCount: rowCount(), mode: viewMode });
+  post({
+    type: 'viewport',
+    topLine: list.topLine,
+    visibleLines: list.visibleLines,
+    rowCount: rowCount(),
+    mode: viewMode,
+    format: format.kind,
+  });
 }
 
 function resetRows(): void {
@@ -212,7 +281,209 @@ function resetRows(): void {
   list.refresh();
 }
 
-function startSearch(query: SearchQuery, jump: boolean): void {
+// ---- formats ----
+
+function renderFileInfo(): void {
+  fileInfoEl.textContent = `${formatBytes(fileSize)} · ${formatLabel(format)}`;
+}
+
+function applyFormat(next: FormatInfo): void {
+  format = next;
+  decorVersion++;
+  const dsv = next.kind === 'dsv';
+  tableHeaderEl.hidden = !dsv;
+  if (dsv) initColumns();
+  if (next.kind !== 'jsonl') hideDetails();
+  bar.setFormat(next.kind);
+  renderFileInfo();
+  list.refresh();
+  list.relayout();
+  scheduleViewport(true);
+}
+
+function columnKey(): string {
+  return `${format.delimiter}|${(format.header ?? []).join(format.delimiter ?? ',')}`;
+}
+
+function initColumns(): void {
+  const header = format.header ?? [];
+  const key = columnKey();
+  columnsAutoSize = false;
+  if (saved.columns?.key === key && saved.columns.widths.length === header.length) {
+    columnWidths = [...saved.columns.widths];
+  } else {
+    columnWidths = header.map((name) => columnWidthFor(name.length));
+    columnsAutoSize = true;
+    autoSizeColumns();
+  }
+  buildTableHeader();
+}
+
+function columnWidthFor(chars: number): number {
+  return Math.round(Math.min(MAX_AUTO_COLUMN_PX, Math.max(MIN_AUTO_COLUMN_PX, (chars + 2) * list.charPixels)));
+}
+
+function alignTableHeader(): void {
+  // Cells start after the gutter and the row padding (see .vl-text .vl-row).
+  tableCellsEl.style.left = `${list.gutterPixels + 12}px`;
+}
+
+/** Sizes columns to the header and the rows loaded so far (90th percentile of cell length). */
+function autoSizeColumns(): void {
+  if (!columnsAutoSize || lineCache.size === 0) return;
+  const lengths: number[][] = (format.header ?? []).map((name) => [name.length]);
+  let sampled = 0;
+  for (const entry of lineCache.values()) {
+    if (sampled++ >= 200) break;
+    parseDsvLine(entry.text, format.delimiter ?? ',').forEach((cell, i) => lengths[i]?.push(cell.length));
+  }
+  columnWidths = lengths.map((ls) => {
+    const sorted = [...ls].sort((a, b) => a - b);
+    return columnWidthFor(sorted[Math.floor((sorted.length - 1) * 0.9)] ?? 0);
+  });
+  columnsAutoSize = false;
+  buildTableHeader();
+  list.refresh();
+  list.relayout();
+}
+
+function buildTableHeader(): void {
+  tableCellsEl.textContent = '';
+  alignTableHeader();
+  (format.header ?? []).forEach((name, i) => {
+    const cell = el('div', 'th-cell');
+    cell.style.width = `${columnWidths[i]}px`;
+    cell.textContent = name;
+    cell.title = name;
+    const handle = el('div', 'th-resize');
+    handle.addEventListener('pointerdown', (e) => startColumnResize(e, i, cell, handle));
+    cell.append(handle);
+    tableCellsEl.append(cell);
+  });
+}
+
+function startColumnResize(e: PointerEvent, index: number, cell: HTMLDivElement, handle: HTMLDivElement): void {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const startX = e.clientX;
+  const startWidth = columnWidths[index] ?? 120;
+  handle.setPointerCapture(e.pointerId);
+  handle.classList.add('dragging');
+  const move = (ev: PointerEvent): void => {
+    if ((ev.buttons & 1) === 0) {
+      end();
+      return;
+    }
+    columnsAutoSize = false;
+    const width = Math.max(MIN_COLUMN_PX, Math.round(startWidth + ev.clientX - startX));
+    columnWidths[index] = width;
+    cell.style.width = `${width}px`;
+    list.refresh();
+    list.relayout();
+  };
+  const end = (): void => {
+    handle.removeEventListener('pointermove', move);
+    handle.removeEventListener('pointerup', end);
+    handle.removeEventListener('lostpointercapture', end);
+    handle.classList.remove('dragging');
+    saved.columns = { key: columnKey(), widths: [...columnWidths] };
+    saveState();
+  };
+  handle.addEventListener('pointermove', move);
+  handle.addEventListener('pointerup', end);
+  handle.addEventListener('lostpointercapture', end);
+}
+
+// ---- JSON details panel ----
+
+function showDetails(row: number): void {
+  if (format.kind !== 'jsonl') return;
+  const line = fileLineOfRow(row);
+  if (line === undefined) return;
+  list.setHighlight(row);
+  detailsEl.hidden = false;
+  detailsEl.textContent = '';
+  detailsEl.append(detailsHead(line), note('Loading…'));
+  post({ type: 'getLineText', reqId: ++detailRequest, line });
+}
+
+function hideDetails(): void {
+  detailsEl.hidden = true;
+  detailsEl.textContent = '';
+  detailRequest++;
+}
+
+function detailsHead(line: number): HTMLDivElement {
+  const head = el('div', 'dt-head');
+  const title = el('span', 'dt-title');
+  title.textContent = `Line ${formatCount(line + 1)}`;
+  const close = el('button', 'sb-button');
+  close.textContent = '×';
+  close.title = 'Close';
+  close.addEventListener('click', hideDetails);
+  head.append(title, close);
+  return head;
+}
+
+function note(text: string, cls = 'dt-note'): HTMLDivElement {
+  const div = el('div', cls);
+  div.textContent = text;
+  return div;
+}
+
+/** Field query value: bare when unambiguous, JSON-quoted otherwise. */
+function queryValue(value: JsonValue): string {
+  const text = fieldValueText(value);
+  return typeof value === 'string' && (text !== text.trim() || text.startsWith('"') || text === '') ? JSON.stringify(value) : text;
+}
+
+function renderDetails(msg: Extract<HostToWebview, { type: 'lineText' }>): void {
+  detailsEl.textContent = '';
+  detailsEl.append(detailsHead(msg.line));
+  if (msg.error) {
+    detailsEl.append(note(msg.error, 'dt-error'));
+    return;
+  }
+  const parsed = parseJsonLine(msg.text);
+  if (!parsed.ok) {
+    detailsEl.append(note(`Not valid JSON: ${parsed.error}${msg.truncated ? ' (the line is longer than 1 MB)' : ''}`, 'dt-error'));
+    const raw = el('pre', 'dt-json');
+    raw.textContent = msg.text.slice(0, DETAIL_JSON_CHARS);
+    detailsEl.append(raw);
+    return;
+  }
+  const fields = flattenJson(parsed.value, DETAIL_FIELDS + 1);
+  const list = el('div', 'dt-fields');
+  for (const field of fields.slice(0, DETAIL_FIELDS)) {
+    const row = el('div', 'dt-field');
+    const path = el('span', 'dt-path');
+    path.textContent = field.path || '(value)';
+    const value = el('span', 'dt-value');
+    const text = fieldValueText(field.value);
+    value.textContent = text;
+    row.title = `${field.path} = ${text.slice(0, 1000)}\nClick to filter by this value`;
+    row.append(path, value);
+    if (field.path) {
+      row.addEventListener('click', () => {
+        const query: Query = { kind: 'field', expression: `${field.path}=${queryValue(field.value)}` };
+        bar.setValue(query);
+        startSearch(query, true);
+      });
+    }
+    list.append(row);
+  }
+  detailsEl.append(list);
+  if (fields.length > DETAIL_FIELDS) detailsEl.append(note(`Showing the first ${DETAIL_FIELDS} fields`));
+  const pretty = el('pre', 'dt-json');
+  const json = JSON.stringify(parsed.value, null, 2);
+  pretty.textContent = json.length > DETAIL_JSON_CHARS ? `${json.slice(0, DETAIL_JSON_CHARS)}\n…` : json;
+  detailsEl.append(pretty);
+}
+
+// ---- search and filter ----
+
+function startSearch(query: Query, jump: boolean): void {
   searchId++;
   searchState = undefined;
   currentHit = -1;
@@ -220,13 +491,14 @@ function startSearch(query: SearchQuery, jump: boolean): void {
   resultCache.clear();
   pendingResultBlocks.clear();
   try {
-    searchRegex = query.text ? compileQuery(query).regex : undefined;
+    searchRegex = isTextQuery(query) && query.text ? compileQuery(query).regex : undefined;
   } catch {
     searchRegex = undefined; // the host reports the error
   }
-  searchVersion++;
+  decorVersion++;
+  const empty = isEmptyQuery(query);
 
-  const mode: FilterMode = query.text ? (pendingFilter ?? viewMode) : 'all';
+  const mode: FilterMode = empty ? 'all' : (pendingFilter ?? viewMode);
   pendingFilter = undefined;
   if (mode !== 'all' || viewMode !== 'all') {
     // Filtered rows are rebuilt from scratch for the new query (or the full file comes back).
@@ -243,9 +515,9 @@ function startSearch(query: SearchQuery, jump: boolean): void {
   list.setHighlight(-1);
   results.setCount(0);
   results.setHighlight(-1);
-  setResultsVisible(query.text !== '');
-  bar.setFilter(mode, query.text !== '');
-  autoJump = jump && query.text !== '';
+  setResultsVisible(!empty);
+  bar.setFilter(mode, !empty);
+  autoJump = jump && !empty;
   saved.query = query;
   saved.filterMode = mode;
   saveState();
@@ -256,11 +528,11 @@ function startSearch(query: SearchQuery, jump: boolean): void {
 }
 
 function requestFilter(mode: FilterMode): void {
-  if (!bar.value.text || !searchState) mode = 'all';
+  if (!hasQuery() || !searchState) mode = 'all';
   if (mode === (pendingFilter ?? viewMode)) return;
   pendingFilter = mode;
   viewId++;
-  bar.setFilter(mode, Boolean(bar.value.text));
+  bar.setFilter(mode, hasQuery());
   post({ type: 'setFilter', searchId, viewId, mode, anchorIndex: list.topLine });
 }
 
@@ -273,7 +545,7 @@ function applyView(mode: FilterMode, count: number, anchorIndex: number): void {
   list.setCount(rowCount());
   list.setHighlight(-1);
   list.scrollToLine(anchorIndex);
-  bar.setFilter(mode, Boolean(bar.value.text));
+  bar.setFilter(mode, hasQuery());
   saved.filterMode = mode;
   saveState();
   renderHeader();
@@ -299,7 +571,7 @@ function navigate(direction: 1 | -1): void {
 }
 
 function renderSearchStatus(): void {
-  if (!bar.value.text) {
+  if (!hasQuery()) {
     bar.setStatus('', { canNavigate: false });
     return;
   }
@@ -381,19 +653,24 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
   switch (msg.type) {
     case 'init':
       fileNameEl.textContent = msg.fileName;
-      fileInfoEl.textContent = formatBytes(msg.fileSize);
+      fileSize = msg.fileSize;
+      renderFileInfo();
       break;
     case 'index':
       indexInfo = msg;
       lineCount = msg.lineCount;
       list.setGutterMax(Math.max(1, msg.lineCount));
       results.setGutterMax(Math.max(1, msg.lineCount));
+      if (format.kind === 'dsv') alignTableHeader();
       if (viewMode === 'all') list.setCount(msg.lineCount);
       renderHeader();
       if (restoreLine > 0 && viewMode === 'all' && (msg.lineCount > restoreLine || msg.done)) {
         list.scrollToLine(restoreLine);
         restoreLine = 0;
       }
+      break;
+    case 'format':
+      applyFormat(msg.format);
       break;
     case 'lines': {
       if (msg.viewId !== viewId) break;
@@ -403,9 +680,13 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       );
       pendingLineBlocks.delete(Math.floor(msg.start / LINE_BLOCK));
       evict(lineCache, MAX_CACHED_LINES, list.topLine, LINE_BLOCK * 3);
+      if (format.kind === 'dsv') autoSizeColumns();
       list.invalidate();
       break;
     }
+    case 'lineText':
+      if (msg.reqId === detailRequest) renderDetails(msg);
+      break;
     case 'reveal':
       if (msg.mode !== viewMode || pendingFilter !== undefined) break;
       restoreLine = 0;
@@ -488,4 +769,4 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
 });
 
 post({ type: 'ready' });
-if (saved.query?.text) startSearch(saved.query, false);
+if (saved.query && !isEmptyQuery(saved.query)) startSearch(saved.query, false);

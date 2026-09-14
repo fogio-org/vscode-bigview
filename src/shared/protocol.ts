@@ -3,10 +3,13 @@
  * Never send large payloads in one message.
  */
 import type { IndexSource } from './format';
-import type { Range, SearchQuery } from './searchQuery';
+import type { FormatInfo, FormatKind } from './formats';
+import type { Query, Range } from './searchQuery';
 
 /** Hard cap on lines in a single `lines` message. */
 export const MAX_LINES_PER_MESSAGE = 500;
+/** A single line sent for a detail view (JSON pretty view) is cut at this size. */
+export const MAX_DETAIL_BYTES = 1024 * 1024;
 /** Hard cap on search results in a single `results` message. */
 export const MAX_RESULTS_PER_MESSAGE = 200;
 
@@ -92,7 +95,10 @@ export type HostToWebview =
     }
   | { type: 'command'; command: WebviewCommand }
   /** Puts a query into the search bar and runs it, as if typed. */
-  | { type: 'setQuery'; query: SearchQuery }
+  | { type: 'setQuery'; query: Query }
+  /** The file format (detected or chosen by the user). */
+  | { type: 'format'; format: FormatInfo }
+  | { type: 'lineText'; reqId: number; line: number; text: string; truncated: boolean; error?: string }
   /** Switches the filter as if the Filter/Invert buttons were used. */
   | { type: 'setFilterMode'; mode: FilterMode };
 
@@ -108,9 +114,11 @@ export type WebviewToHost =
       mode: FilterMode;
       searchId: number;
     }
-  | { type: 'viewport'; topLine: number; visibleLines: number; rowCount: number; mode: FilterMode }
-  /** Starts a search, cancelling the previous one; an empty text clears the search. */
-  | { type: 'search'; searchId: number; query: SearchQuery; mode: FilterMode }
+  | { type: 'viewport'; topLine: number; visibleLines: number; rowCount: number; mode: FilterMode; format: FormatKind }
+  /** Starts a search, cancelling the previous one; an empty query clears the search. */
+  | { type: 'search'; searchId: number; query: Query; mode: FilterMode }
+  /** Full text of one file line (up to MAX_DETAIL_BYTES). */
+  | { type: 'getLineText'; reqId: number; line: number }
   | { type: 'getResults'; searchId: number; reqId: number; start: number; count: number }
   | { type: 'gotoHit'; searchId: number; target: HitTarget }
   /** Changes the filter mode; `anchorIndex` is the current top row. */

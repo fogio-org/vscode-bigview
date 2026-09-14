@@ -20,6 +20,10 @@ export interface FixtureSpec {
 export const FIXTURES = {
   small: { name: 'it-10m.log', tier: 'default', opts: { sizeBytes: 10 * MB, format: 'log', unicode: true, seed: 7, markerCount: 37 } },
   tiny: { name: 'it-default.log', tier: 'default', opts: { sizeBytes: 1 * MB, format: 'log', seed: 3 } },
+  jsonl: { name: 'it-10m.jsonl', tier: 'default', opts: { sizeBytes: 10 * MB, format: 'jsonl', unicode: true, seed: 17, markerCount: 29 } },
+  /** JSON Lines content behind a .log extension: detected by content. */
+  jsonLog: { name: 'it-json.log', tier: 'default', opts: { sizeBytes: 1 * MB, format: 'jsonl', seed: 23 } },
+  csv: { name: 'it-5m.csv', tier: 'default', opts: { sizeBytes: 5 * MB, format: 'csv', seed: 19 } },
   m200: { name: 'it-200m.log', tier: 'large', opts: { sizeBytes: 200 * MB, format: 'log', avgLineLength: 200, seed: 11 } },
   /** SPEC M3 acceptance: exactly 137 lines contain NEEDLE_MARKER. */
   g1: { name: 'it-1g.log', tier: 'large', opts: { sizeBytes: 1024 * MB, format: 'log', avgLineLength: 200, seed: 11, markerCount: 137 } },

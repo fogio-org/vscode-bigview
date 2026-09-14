@@ -1,5 +1,5 @@
 /** Messages between the extension host and worker threads. */
-import type { SearchQuery } from '../shared/searchQuery';
+import type { Query } from '../shared/searchQuery';
 
 export interface IndexerWorkerData {
   filePath: string;
@@ -46,7 +46,7 @@ export interface SearchRequest {
   type: 'search';
   id: number;
   filePath: string;
-  query: SearchQuery;
+  query: Query;
   chunkBytes?: number;
   overlapBytes?: number;
   progressBytes?: number;

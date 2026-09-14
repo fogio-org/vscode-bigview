@@ -384,3 +384,216 @@ body {
 #results[hidden] {
   display: none;
 }
+
+/* ---- Layout: list, table header, details panel ---- */
+
+#main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+#content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+#main[hidden],
+#table-header[hidden],
+#details[hidden] {
+  display: none;
+}
+
+/* ---- Search bar: query kinds ---- */
+
+.sb-kind {
+  padding: 2px 4px;
+  border: 1px solid var(--vscode-dropdown-border, transparent);
+  border-radius: 2px;
+  background: var(--vscode-dropdown-background);
+  color: var(--vscode-dropdown-foreground);
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+}
+
+.sb-kind[hidden],
+.sb-field[hidden] {
+  display: none;
+}
+
+.sb-time .sb-input {
+  min-width: 120px;
+}
+
+.sb-dash {
+  color: var(--vscode-descriptionForeground);
+}
+
+/* ---- Log format ---- */
+
+.vl-row.lvl-fatal,
+.vl-row.lvl-error {
+  color: var(--vscode-errorForeground);
+}
+
+.vl-row.lvl-warn {
+  color: var(--vscode-editorWarning-foreground);
+}
+
+.vl-row.lvl-debug,
+.vl-row.lvl-trace {
+  color: var(--vscode-descriptionForeground);
+}
+
+.log-level {
+  font-weight: 600;
+}
+
+.log-ts {
+  color: var(--vscode-descriptionForeground);
+}
+
+/* ---- DSV table ---- */
+
+.vl-cell {
+  display: inline-block;
+  box-sizing: border-box;
+  padding: 0 8px 0 0;
+  margin-right: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+  border-right: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.vl-row.dsv-header-row {
+  font-weight: 600;
+}
+
+#table-header {
+  flex: none;
+  position: relative;
+  overflow: hidden;
+  height: var(--vl-line-height, 20px);
+  line-height: var(--vl-line-height, 20px);
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+  font-family: var(--vscode-editor-font-family);
+  font-size: var(--vscode-editor-font-size);
+  font-weight: 600;
+  white-space: nowrap;
+  user-select: none;
+}
+
+#table-header-cells {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
+}
+
+.th-cell {
+  position: relative;
+  display: inline-block;
+  box-sizing: border-box;
+  padding: 0 8px 0 0;
+  margin-right: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+
+.th-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  touch-action: none;
+  border-right: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.th-resize:hover,
+.th-resize.dragging {
+  background: var(--vscode-sash-hoverBorder);
+}
+
+/* ---- JSON details panel ---- */
+
+#details {
+  flex: none;
+  width: 40%;
+  min-width: 260px;
+  max-width: 70%;
+  overflow: auto;
+  border-left: 1px solid var(--vscode-panel-border, transparent);
+  font-family: var(--vscode-editor-font-family);
+  font-size: var(--vscode-editor-font-size);
+}
+
+.dt-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+}
+
+.dt-note {
+  padding: 4px 8px;
+  color: var(--vscode-descriptionForeground);
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+}
+
+.dt-error {
+  padding: 4px 8px;
+  color: var(--vscode-errorForeground);
+}
+
+.dt-fields {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.dt-field {
+  display: flex;
+  gap: 12px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.dt-field:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.dt-path {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-symbolIcon-fieldForeground, var(--vscode-foreground));
+}
+
+.dt-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dt-json {
+  margin: 0;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

@@ -9,6 +9,35 @@ export interface SearchQuery {
 
 export const EMPTY_QUERY: SearchQuery = { text: '', caseSensitive: false, wholeWord: false, regex: false };
 
+/**
+ * Log lines whose timestamp is within [from, to]; lines without a timestamp (e.g. stack traces)
+ * belong to the timestamp above them. Either bound may be empty.
+ */
+export interface TimeRangeQuery {
+  kind: 'time';
+  from: string;
+  to: string;
+}
+
+/** JSON Lines field predicate: `path=value` or `path~regex`. */
+export interface FieldQuery {
+  kind: 'field';
+  expression: string;
+}
+
+/** Everything the search worker can match lines by (SPEC §2: regex plus preset predicates). */
+export type Query = SearchQuery | TimeRangeQuery | FieldQuery;
+
+export function isTextQuery(q: Query): q is SearchQuery {
+  return !('kind' in q);
+}
+
+export function isEmptyQuery(q: Query): boolean {
+  if (isTextQuery(q)) return q.text === '';
+  if (q.kind === 'time') return q.from.trim() === '' && q.to.trim() === '';
+  return q.expression.trim() === '';
+}
+
 /** [start, end) in UTF-16 code units. */
 export type Range = readonly [start: number, end: number];
 
@@ -110,8 +139,8 @@ const isLowSurrogate = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
 const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
 
 /** A short excerpt of `line` around its first match, for the results list. */
-export function makeSnippet(line: string, regex: RegExp, maxChars = 300, context = 40): Snippet {
-  const ranges = findRanges(line, regex, 50);
+export function makeSnippet(line: string, regex: RegExp | undefined, maxChars = 300, context = 40): Snippet {
+  const ranges = regex ? findRanges(line, regex, 50) : [];
   let start = 0;
   const first = ranges[0];
   if (first && first[0] > context) start = first[0] - context;

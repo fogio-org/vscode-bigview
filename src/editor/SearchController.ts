@@ -11,7 +11,8 @@ import {
   type SearchStatus,
   type WebviewToHost,
 } from '../shared/protocol';
-import { compileQuery, makeSnippet, type SearchQuery } from '../shared/searchQuery';
+import { validateQuery } from '../formats/predicates';
+import { isEmptyQuery, makeSnippet, type Query } from '../shared/searchQuery';
 import type { SearchTask, SearchWorker } from '../workers/workerPool';
 import type { BigViewDocument } from './BigViewProvider';
 
@@ -22,7 +23,7 @@ const SCATTERED_READ_BLOCK_BYTES = 64 * 1024;
 
 export interface SearchState {
   searchId: number;
-  query: SearchQuery | undefined;
+  query: Query | undefined;
   status: SearchStatus;
   /** Matching lines found so far. */
   total: number;
@@ -104,20 +105,21 @@ export class SearchController implements vscode.Disposable {
     return this.hits.toArray();
   }
 
-  start(searchId: number, query: SearchQuery, mode: FilterMode = 'all'): void {
+  start(searchId: number, query: Query, mode: FilterMode = 'all'): void {
     this.stopTask();
     const hits = new LineSet();
     this.hits = hits;
     this.regex = undefined;
     this.lastHit = undefined;
-    this.filterMode = query.text === '' ? 'all' : mode;
+    const empty = isEmptyQuery(query);
+    this.filterMode = empty ? 'all' : mode;
 
-    if (query.text === '') {
+    if (empty) {
       this.replace(idle(searchId));
       return;
     }
     try {
-      this.regex = compileQuery(query).regex;
+      this.regex = validateQuery(query);
     } catch (err) {
       this.replace({ ...idle(searchId), query, status: 'error', error: messageOf(err) });
       return;
@@ -282,8 +284,8 @@ export class SearchController implements vscode.Disposable {
 
   /** Result rows with excerpts; undefined if the search is no longer current. */
   async readResults(searchId: number, start: number, count: number): Promise<SearchResultItem[] | undefined> {
-    const regex = this.regex;
-    if (searchId !== this.current.searchId || !regex) return undefined;
+    const regex = this.regex; // undefined for time/field queries: excerpts without highlights
+    if (searchId !== this.current.searchId || !this.current.query) return undefined;
     const first = Math.max(0, Math.floor(start));
     const n = Math.min(Math.max(0, count), MAX_RESULTS_PER_MESSAGE, this.hits.size - first);
     if (n <= 0) return [];

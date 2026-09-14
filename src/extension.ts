@@ -7,6 +7,7 @@ import { BigViewProvider } from './editor/BigViewProvider';
 import { BigViewStatusBar } from './editor/StatusBar';
 import { isPro } from './license';
 import { formatBytes, formatCount } from './shared/format';
+import { formatLabel, type FormatChoice, type FormatInfo, type FormatKind } from './shared/formats';
 import { parseLineNumber } from './shared/lineNumber';
 import { WorkerPool, type ExportOutcome } from './workers/workerPool';
 
@@ -22,7 +23,11 @@ export function activate(context: vscode.ExtensionContext): BigViewApi {
   const workers = new WorkerPool(vscode.Uri.joinPath(context.extensionUri, 'dist').fsPath);
   const store = new IndexStore(vscode.Uri.joinPath(context.globalStorageUri, 'index').fsPath);
   void store.cleanup();
-  const provider = new BigViewProvider(context.extensionUri, { pool, workers, store });
+  const formats = {
+    get: (filePath: string) => context.workspaceState.get<FormatChoice>(`bigview.format:${filePath}`),
+    set: (filePath: string, choice: FormatChoice | undefined) => context.workspaceState.update(`bigview.format:${filePath}`, choice),
+  };
+  const provider = new BigViewProvider(context.extensionUri, { pool, workers, store, formats });
   const statusBar = new BigViewStatusBar(provider);
 
   context.subscriptions.push(
@@ -37,6 +42,7 @@ export function activate(context: vscode.ExtensionContext): BigViewApi {
     vscode.commands.registerCommand('bigview.toggleFilter', () => provider.active?.runCommand('toggleFilter')),
     vscode.commands.registerCommand('bigview.toggleInvert', () => provider.active?.runCommand('toggleInvert')),
     vscode.commands.registerCommand('bigview.exportFiltered', (target?: unknown) => exportFiltered(provider, workers, target)),
+    vscode.commands.registerCommand('bigview.changeFormat', (choice?: unknown) => changeFormat(provider, choice)),
     statusBar,
     provider,
     { dispose: () => workers.dispose() },
@@ -83,6 +89,57 @@ async function goToLine(provider: BigViewProvider, line?: unknown): Promise<void
   }
   if (target === undefined || lineCount() === 0) return;
   editor.reveal(Math.min(Math.max(1, Math.floor(target)), lineCount()) - 1);
+}
+
+const FORMAT_KINDS: readonly FormatKind[] = ['text', 'log', 'jsonl', 'dsv'];
+
+/** Accepts 'auto', a kind ('log', 'jsonl', 'text', 'dsv', 'csv', 'tsv') or a FormatChoice. */
+function parseFormatArg(arg: unknown): FormatChoice | 'auto' | undefined {
+  if (arg === 'auto') return 'auto';
+  if (arg === 'csv') return { kind: 'dsv', delimiter: ',' };
+  if (arg === 'tsv') return { kind: 'dsv', delimiter: '\t' };
+  if (typeof arg === 'string' && (FORMAT_KINDS as readonly string[]).includes(arg)) return { kind: arg as FormatKind };
+  if (arg && typeof arg === 'object' && FORMAT_KINDS.includes((arg as FormatChoice).kind)) {
+    const { kind, delimiter } = arg as FormatChoice;
+    return delimiter === undefined ? { kind } : { kind, delimiter };
+  }
+  return undefined;
+}
+
+/** BigView: Change Format… (SPEC §6 M5: manual format switching). */
+async function changeFormat(provider: BigViewProvider, arg?: unknown): Promise<FormatInfo | undefined> {
+  const editor = provider.active;
+  if (!editor) {
+    void vscode.window.showInformationMessage('Open a file in BigView to change its format.');
+    return undefined;
+  }
+  let choice = parseFormatArg(arg);
+  if (choice === undefined) {
+    const current = editor.doc.format;
+    const isCurrent = (c: FormatChoice): boolean =>
+      current?.source === 'user' && current.kind === c.kind && (c.kind !== 'dsv' || current.delimiter === c.delimiter);
+    const options: Array<{ label: string; choice: FormatChoice }> = [
+      { label: 'Log', choice: { kind: 'log' } },
+      { label: 'JSON Lines', choice: { kind: 'jsonl' } },
+      { label: 'CSV (comma-separated)', choice: { kind: 'dsv', delimiter: ',' } },
+      { label: 'TSV (tab-separated)', choice: { kind: 'dsv', delimiter: '\t' } },
+      { label: 'Semicolon-separated', choice: { kind: 'dsv', delimiter: ';' } },
+      { label: 'Pipe-separated', choice: { kind: 'dsv', delimiter: '|' } },
+      { label: 'Plain text', choice: { kind: 'text' } },
+    ];
+    const items: Array<vscode.QuickPickItem & { choice: FormatChoice | 'auto' }> = [
+      {
+        label: 'Auto-detect',
+        description: current && current.source !== 'user' ? `current: ${formatLabel(current)}` : undefined,
+        choice: 'auto',
+      },
+      ...options.map((o) => ({ label: o.label, description: isCurrent(o.choice) ? 'current' : undefined, choice: o.choice })),
+    ];
+    const picked = await vscode.window.showQuickPick(items, { title: 'BigView: Change Format', placeHolder: 'Show this file as…' });
+    if (!picked) return undefined;
+    choice = picked.choice;
+  }
+  return editor.doc.setFormat(choice === 'auto' ? undefined : choice);
 }
 
 export interface ExportResult {
