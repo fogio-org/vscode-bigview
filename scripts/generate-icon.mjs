@@ -1,75 +1,65 @@
-// Generates images/icon.png (128×128) without dependencies: supersampled shapes → PNG via zlib.
+// Generates assets/icon.png (640×640) in the fogio extension icon style: a full-bleed rounded
+// square in a muted color with a bold white glyph. No dependencies: supersampled shapes → PNG.
 //   node scripts/generate-icon.mjs
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 
-const SIZE = 128;
-const SS = 4; // samples per axis
+const SIZE = 640;
+const SS = 3; // samples per axis
+const RADIUS = 120; // same corner radius as the other fogio icons
 
-const rgba = (hex, a = 1) => [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16), a];
-const BG = rgba('#1b2440');
-const LINE = rgba('#6f86b8');
-const HIT = rgba('#f2c14e');
-const LENS = rgba('#2d3d6b');
-const RING = rgba('#e8eefc');
+const BG = [0xb0, 0x7a, 0x52];
+const FG = [0xff, 0xff, 0xff];
 
 const roundRect = (x, y, x0, y0, x1, y1, r) => {
   const cx = Math.min(Math.max(x, x0 + r), x1 - r);
   const cy = Math.min(Math.max(y, y0 + r), y1 - r);
   return (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
 };
-const segmentDistance = (x, y, ax, ay, bx, by) => {
+const capsule = (x, y, ax, ay, bx, by, r) => {
   const t = Math.max(0, Math.min(1, ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / ((bx - ax) ** 2 + (by - ay) ** 2)));
-  return Math.hypot(x - (ax + t * (bx - ax)), y - (ay + t * (by - ay)));
+  return Math.hypot(x - (ax + t * (bx - ax)), y - (ay + t * (by - ay))) <= r;
 };
 
-// "Text lines" of a log, one highlighted as a search hit.
-const bars = [
-  { y: 26, x1: 98, color: LINE },
-  { y: 40, x1: 76, color: LINE },
-  { y: 54, x1: 104, color: HIT },
-  { y: 68, x1: 60, color: LINE },
-  { y: 82, x1: 50, color: LINE },
-  { y: 96, x1: 44, color: LINE },
-];
-const lens = { cx: 82, cy: 78, r: 22 };
+// Glyph: a magnifier over two lines of text — viewing and searching inside a file.
+const lens = { cx: 282, cy: 282, inner: 96, outer: 152 };
 
 function shade(x, y) {
-  if (!roundRect(x, y, 4, 4, 124, 124, 26)) return null;
-  let color = BG;
-  for (const b of bars) if (roundRect(x, y, 20, b.y - 4, b.x1, b.y + 4, 4)) color = b.color;
+  if (!roundRect(x, y, 0, 0, SIZE, SIZE, RADIUS)) return null;
   const d = Math.hypot(x - lens.cx, y - lens.cy);
-  if (d < lens.r - 4) color = [LENS[0], LENS[1], LENS[2], 1];
-  if (d >= lens.r - 4 && d <= lens.r + 4) color = RING;
-  if (segmentDistance(x, y, 99, 95, 113, 109) <= 6) color = RING;
-  return color;
+  const glyph =
+    (d >= lens.inner && d <= lens.outer) ||
+    capsule(x, y, 392, 392, 480, 480, 32) ||
+    capsule(x, y, 222, 252, 342, 252, 18) ||
+    capsule(x, y, 222, 312, 306, 312, 18);
+  return glyph ? FG : BG;
 }
 
 const pixels = Buffer.alloc(SIZE * SIZE * 4);
 for (let py = 0; py < SIZE; py++) {
   for (let px = 0; px < SIZE; px++) {
-    let r = 0, g = 0, b = 0, a = 0;
+    let r = 0, g = 0, b = 0, n = 0;
     for (let sy = 0; sy < SS; sy++) {
       for (let sx = 0; sx < SS; sx++) {
         const c = shade(px + (sx + 0.5) / SS, py + (sy + 0.5) / SS);
         if (!c) continue;
-        r += c[0] * c[3];
-        g += c[1] * c[3];
-        b += c[2] * c[3];
-        a += c[3];
+        r += c[0];
+        g += c[1];
+        b += c[2];
+        n++;
       }
     }
     const i = (py * SIZE + px) * 4;
-    pixels[i] = a ? Math.round(r / a) : 0;
-    pixels[i + 1] = a ? Math.round(g / a) : 0;
-    pixels[i + 2] = a ? Math.round(b / a) : 0;
-    pixels[i + 3] = Math.round((a / (SS * SS)) * 255);
+    pixels[i] = n ? Math.round(r / n) : 0;
+    pixels[i + 1] = n ? Math.round(g / n) : 0;
+    pixels[i + 2] = n ? Math.round(b / n) : 0;
+    pixels[i + 3] = Math.round((n / (SS * SS)) * 255);
   }
 }
 
-const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+const CRC_TABLE = Array.from({ length: 256 }, (_, k) => {
+  let c = k;
+  for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
   return c >>> 0;
 });
 const crc32 = (buf) => {
@@ -100,6 +90,6 @@ const png = Buffer.concat([
   chunk('IDAT', deflateSync(raw, { level: 9 })),
   chunk('IEND', Buffer.alloc(0)),
 ]);
-mkdirSync('images', { recursive: true });
-writeFileSync('images/icon.png', png);
-console.log(`images/icon.png ${png.length} bytes`);
+mkdirSync('assets', { recursive: true });
+writeFileSync('assets/icon.png', png);
+console.log(`assets/icon.png ${png.length} bytes`);

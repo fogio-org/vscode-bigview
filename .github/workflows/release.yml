@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # vitest 5 and @vscode/vsce 4 need Node 22.
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Collect release metadata
+        id: meta
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          # Идентификатор для fogio-api берётся из манифеста, а не прописывается
+          # в workflow: иначе он разъедется с package.json при переименовании.
+          echo "extension_id=$(node -p "const p = require('./package.json'); p.publisher + '.' + p.name")" >> "$GITHUB_OUTPUT"
+      - name: Check notification credentials
+        id: secrets-check
+        env:
+          FOGIO_BOT_APP_ID: ${{ secrets.FOGIO_BOT_APP_ID }}
+          FOGIO_BOT_PRIVATE_KEY: ${{ secrets.FOGIO_BOT_PRIVATE_KEY }}
+          FOGIO_API_TOKEN: ${{ secrets.FOGIO_API_TOKEN }}
+        run: |
+          if [ -n "$FOGIO_BOT_APP_ID" ] && [ -n "$FOGIO_BOT_PRIVATE_KEY" ]; then
+            echo "has_fogio_bot=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_fogio_bot=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "$FOGIO_API_TOKEN" ]; then
+            echo "has_fogio_api=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_fogio_api=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Generate fogio-ci bot token
+        id: bot-token
+        if: ${{ steps.secrets-check.outputs.has_fogio_bot == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.FOGIO_BOT_APP_ID }}
+          private-key: ${{ secrets.FOGIO_BOT_PRIVATE_KEY }}
+      - name: Publish to VS Code Marketplace
+        id: publish-vsce
+        continue-on-error: true
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx --yes @vscode/vsce publish --no-dependencies
+      - name: Publish to Open VSX
+        id: publish-ovsx
+        continue-on-error: true
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx --yes ovsx publish --no-dependencies
+      - name: Prepare release notification body
+        if: always()
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_RUN_URL: ${{ steps.meta.outputs.run_url }}
+          VSCE_OUTCOME: ${{ steps.publish-vsce.outcome }}
+          OVSX_OUTCOME: ${{ steps.publish-ovsx.outcome }}
+        run: |
+          if [ "$VSCE_OUTCOME" = "success" ] && [ "$OVSX_OUTCOME" = "success" ]; then
+            STATUS_ICON="✅"
+            STATUS_TEXT="Release deployed"
+          else
+            STATUS_ICON="❌"
+            STATUS_TEXT="Release failed"
+          fi
+
+          {
+            echo "### ${STATUS_ICON} ${STATUS_TEXT}"
+            echo
+            echo "- Version: \`${RELEASE_VERSION}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- VS Code Marketplace: \`${VSCE_OUTCOME}\`"
+            echo "- Open VSX: \`${OVSX_OUTCOME}\`"
+            echo "- Workflow run: [\`${GITHUB_RUN_ID}\`](${RELEASE_RUN_URL})"
+          } > release-comment.md
+      - name: Post fogio-ci release comment
+        if: ${{ always() && steps.bot-token.outputs.token != '' }}
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+        run: |
+          COMMENT_BODY="$(cat release-comment.md)"
+          PRS_JSON="$(gh api -H "Accept: application/vnd.github+json" "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" || echo '[]')"
+          PR_NUMBER="$(printf '%s' "$PRS_JSON" | node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync(0, 'utf8')); process.stdout.write(data[0]?.number ? String(data[0].number) : '')")"
+
+          if [ -n "$PR_NUMBER" ]; then
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$COMMENT_BODY"
+          else
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/comments" \
+              -f body="$COMMENT_BODY"
+          fi
+      # Уведомление уходит в fogio-api, а он уже решает, как это выглядит
+      # и куда доставляется. Здесь только факты: что, какой версии и чем
+      # закончилось на каждой площадке.
+      - name: Notify fogio API
+        if: ${{ always() && steps.secrets-check.outputs.has_fogio_api == 'true' }}
+        # Уведомление — не результат работы: недоступный api не повод красить
+        # успешную публикацию.
+        continue-on-error: true
+        env:
+          FOGIO_API_TOKEN: ${{ secrets.FOGIO_API_TOKEN }}
+          EXTENSION_ID: ${{ steps.meta.outputs.extension_id }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_RUN_URL: ${{ steps.meta.outputs.run_url }}
+          VSCE_RESULT: ${{ steps.publish-vsce.outcome }}
+          OVSX_RESULT: ${{ steps.publish-ovsx.outcome }}
+        run: |
+          set -euo pipefail
+
+          payload="$(jq -n \
+            --arg extension "$EXTENSION_ID" \
+            --arg version "$RELEASE_VERSION" \
+            --arg marketplace "$VSCE_RESULT" \
+            --arg openvsx "$OVSX_RESULT" \
+            --arg run_url "$RELEASE_RUN_URL" \
+            '{
+              template: "vsc_release",
+              data: {
+                extension: $extension,
+                version: $version,
+                marketplace: $marketplace,
+                openvsx: $openvsx,
+                run_url: $run_url
+              }
+            }')"
+
+          curl -fsS --retry 2 --retry-delay 3 \
+            -X POST https://api.fogio.org/v1/notify \
+            -H "Authorization: Bearer ${FOGIO_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Idempotency-Key: release-${GITHUB_SHA}" \
+            -d "$payload"
+      - name: Fail workflow if publish failed
+        if: ${{ steps.publish-vsce.outcome != 'success' || steps.publish-ovsx.outcome != 'success' }}
+        run: exit 1

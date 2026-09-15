@@ -3,3 +3,4 @@ dist/
 test/.tmp/
 .vscode-test/
 *.vsix
+.DS_Store

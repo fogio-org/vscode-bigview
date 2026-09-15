@@ -6,7 +6,7 @@
 !dist/export.worker.js
 !dist/webview.js
 !dist/webview.css
-!images/icon.png
+!assets/icon.png
 !package.json
 !README.md
 !CHANGELOG.md

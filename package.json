@@ -5,16 +5,23 @@
   "version": "0.1.0",
   "publisher": "fogio",
   "license": "MIT",
-  "private": true,
-  "icon": "images/icon.png",
+  "icon": "assets/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/fogio-org/vscode-bigview.git"
+    "url": "https://github.com/fogio-org/vscode-bigview"
   },
   "bugs": {
-    "url": "https://github.com/fogio-org/vscode-bigview/issues"
+    "url": "https://github.com/fogio-org/vscode-bigview/issues",
+    "email": "team@fogio.org"
   },
   "homepage": "https://github.com/fogio-org/vscode-bigview#readme",
+  "galleryBanner": {
+    "color": "#1E1F22",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
   "categories": [
     "Visualization",
     "Data Science",
@@ -35,13 +42,6 @@
     "filter",
     "grep"
   ],
-  "galleryBanner": {
-    "color": "#1b2440",
-    "theme": "dark"
-  },
-  "engines": {
-    "vscode": "^1.90.0"
-  },
   "main": "./dist/extension.js",
   "contributes": {
     "customEditors": [
@@ -202,6 +202,7 @@
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm run build -- --production",
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc -p . --noEmit && tsc -p webview --noEmit",
