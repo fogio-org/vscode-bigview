@@ -24,19 +24,19 @@
 
 A 1 GB log with 5 million lines — a regular expression search across the whole file, levels and timestamps highlighted.
 
-![BigView — 1 GB log with a regex search](https://raw.githubusercontent.com/fogio-org/vscode-bigview/master/assets/screenshot-log.png)
+![BigView — 1 GB log with a regex search](https://raw.githubusercontent.com/fogio-org/vscode-bigview/refs/heads/master/assets/screenshot-log.png)
 
 ### JSON Lines
 
 Field filter, syntax highlighting in your theme's colors and a details panel for the selected line.
 
-![BigView — JSON Lines with a field filter and the details panel](https://raw.githubusercontent.com/fogio-org/vscode-bigview/master/assets/screenshot-jsonl.png)
+![BigView — JSON Lines with a field filter and the details panel](https://raw.githubusercontent.com/fogio-org/vscode-bigview/refs/heads/master/assets/screenshot-jsonl.png)
 
 ### CSV
 
 Table view with a header row and resizable columns; matches are highlighted inside cells.
 
-![BigView — CSV table with search matches](https://raw.githubusercontent.com/fogio-org/vscode-bigview/master/assets/screenshot-csv.png)
+![BigView — CSV table with search matches](https://raw.githubusercontent.com/fogio-org/vscode-bigview/refs/heads/master/assets/screenshot-csv.png)
 
 ---
 
