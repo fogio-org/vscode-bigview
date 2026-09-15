@@ -9,7 +9,6 @@ import { describeFsError, isStorageError } from '../core/errors';
 import type { FileHandlePool } from '../core/FileHandlePool';
 import { restoreLineIndex, type IndexStore } from '../core/IndexStore';
 import { LineIndex, LineStartScanner } from '../core/LineIndex';
-import { FREE_FILE_SIZE_LIMIT, isPro } from '../license';
 import type { IndexSource, IndexState, StatusInfo } from '../shared/format';
 import { detectFormat, type FormatChoice, type FormatInfo, type FormatKind } from '../shared/formats';
 import {
@@ -98,9 +97,6 @@ export class BigViewDocument implements vscode.CustomDocument {
       throw new Error(describeFsError(err, filePath, 'open'));
     }
     if (!stat.isFile()) throw new Error(`${path.basename(filePath)} is not a regular file.`);
-    if (stat.size > FREE_FILE_SIZE_LIMIT && !isPro()) {
-      throw new Error('Files larger than 200 MB require BigView Pro.');
-    }
     let head: Buffer;
     try {
       head = await deps.pool.read(filePath, 0, Math.min(stat.size, BINARY_SAMPLE_BYTES));
@@ -246,8 +242,7 @@ export class BigViewDocument implements vscode.CustomDocument {
   // ---- tail -f and rotation (SPEC §6 M6) ----
 
   private startWatching(): void {
-    // Tail is a future Pro feature (SPEC §3.9).
-    if (this.disposed || !isPro()) return;
+    if (this.disposed) return;
     this.watcher = new TailWatcher(this.uri.fsPath, (snap) => this.enqueue(() => this.sync(snap)), this.deps.tailPollMs);
     // The file may have changed while it was being indexed.
     this.enqueue(async () => this.sync(await snapshotOf(this.uri.fsPath)));

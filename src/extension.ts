@@ -6,7 +6,6 @@ import { FileHandlePool } from './core/FileHandlePool';
 import { IndexStore } from './core/IndexStore';
 import { BigViewProvider } from './editor/BigViewProvider';
 import { BigViewStatusBar } from './editor/StatusBar';
-import { isPro } from './license';
 import { formatBytes, formatCount } from './shared/format';
 import { formatLabel, type FormatChoice, type FormatInfo, type FormatKind } from './shared/formats';
 import { parseLineNumber } from './shared/lineNumber';
@@ -160,10 +159,6 @@ async function exportFiltered(provider: BigViewProvider, workers: WorkerPool, ta
   const editor = provider.active;
   if (!editor) {
     void vscode.window.showInformationMessage('Open a file in BigView to export lines.');
-    return undefined;
-  }
-  if (!isPro()) {
-    void vscode.window.showWarningMessage('Exporting lines requires BigView Pro.');
     return undefined;
   }
   const search = editor.search;
