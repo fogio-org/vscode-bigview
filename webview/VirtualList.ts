@@ -35,6 +35,8 @@ export interface RowData {
   marks?: readonly Mark[];
   /** Table cells: rendered instead of `text` when the list has cell widths. */
   cells?: readonly string[];
+  /** Search match ranges within each cell's own text (cell text differs from the raw line). */
+  cellRanges?: ReadonlyArray<readonly Range[] | undefined>;
 }
 
 export interface VirtualListOptions {
@@ -505,16 +507,22 @@ function renderRow(node: HTMLDivElement, data: RowData | undefined, cellWidths: 
     data.cells.forEach((cell, i) => {
       const span = el('span', 'vl-cell');
       span.style.width = `${cellWidths[i] ?? DEFAULT_CELL_PX}px`;
-      span.textContent = cell;
+      appendMarked(span, cell, matchMarks(data.cellRanges?.[i]));
       node.append(span);
     });
     return;
   }
   const text = data?.text ?? '';
   if (data?.cutStart) node.append('…');
-  const marks: Mark[] = [];
-  for (const [start, end] of data?.ranges ?? []) marks.push({ start, end, cls: 'vl-match' });
-  if (data?.marks) marks.push(...data.marks);
+  appendMarked(node, text, [...matchMarks(data?.ranges), ...(data?.marks ?? [])]);
+}
+
+function matchMarks(ranges: readonly Range[] | undefined): Mark[] {
+  return (ranges ?? []).map(([start, end]) => ({ start, end, cls: 'vl-match' }));
+}
+
+/** Appends `text` to `node`, wrapping marked pieces in spans with the classes of their marks. */
+function appendMarked(node: HTMLElement, text: string, marks: readonly Mark[]): void {
   if (marks.length === 0) {
     node.append(text);
     return;

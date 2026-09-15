@@ -162,6 +162,7 @@ function decorate(entry: CachedLine): void {
   entry.cls = undefined;
   entry.marks = undefined;
   entry.cells = undefined;
+  entry.cellRanges = undefined;
   switch (format.kind) {
     case 'log': {
       const marks: Mark[] = [];
@@ -175,10 +176,15 @@ function decorate(entry: CachedLine): void {
       entry.marks = marks;
       break;
     }
-    case 'dsv':
-      entry.cells = parseDsvLine(entry.text, format.delimiter ?? ',');
+    case 'dsv': {
+      const cells = parseDsvLine(entry.text, format.delimiter ?? ',');
+      entry.cells = cells;
+      // Matches are highlighted within cells; a match spanning a delimiter still finds the row.
+      const regex = searchRegex;
+      if (regex) entry.cellRanges = cells.map((cell) => findRanges(cell, regex));
       if (entry.lineNumber === 0) entry.cls = 'dsv-header-row';
       break;
+    }
     default:
       break;
   }
