@@ -597,3 +597,21 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* ---- JSON syntax colors: the editor theme's JSON token colors (--bv-json-*, sent by the host) ---- */
+
+.json-key {
+  color: var(--bv-json-key, var(--vscode-debugTokenExpression-name));
+}
+
+.json-string {
+  color: var(--bv-json-string, var(--vscode-debugTokenExpression-string));
+}
+
+.json-number {
+  color: var(--bv-json-number, var(--vscode-debugTokenExpression-number));
+}
+
+.json-literal {
+  color: var(--bv-json-literal, var(--vscode-debugTokenExpression-boolean));
+}

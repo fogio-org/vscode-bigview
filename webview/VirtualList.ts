@@ -233,6 +233,15 @@ export class VirtualList {
     return this.scrollLeft;
   }
 
+  /** The last row is visible (the user is "at the end", so tail should follow). */
+  get isAtEnd(): boolean {
+    return this.virtualTop >= this.maxScrollTop - this.lineHeight;
+  }
+
+  scrollToEnd(): void {
+    this.setScrollTop(Number.MAX_SAFE_INTEGER);
+  }
+
   /** Recomputes sizes (e.g. after table column widths changed). */
   relayout(): void {
     this.layout();
@@ -522,30 +531,42 @@ function matchMarks(ranges: readonly Range[] | undefined): Mark[] {
 }
 
 /** Appends `text` to `node`, wrapping marked pieces in spans with the classes of their marks. */
-function appendMarked(node: HTMLElement, text: string, marks: readonly Mark[]): void {
+export function appendMarked(node: HTMLElement, text: string, marks: readonly Mark[]): void {
   if (marks.length === 0) {
     node.append(text);
     return;
   }
-  // Split at every mark boundary; each piece gets the classes of the marks covering it.
-  const cuts = new Set<number>([0, text.length]);
-  for (const m of marks) {
-    cuts.add(clamp(m.start, 0, text.length));
-    cuts.add(clamp(m.end, 0, text.length));
-  }
-  const points = [...cuts].sort((a, b) => a - b);
-  for (let k = 0; k + 1 < points.length; k++) {
-    const a = points[k] as number;
-    const b = points[k + 1] as number;
-    const classes = marks.filter((m) => m.start <= a && m.end >= b).map((m) => m.cls);
-    if (classes.length === 0) {
-      node.append(text.slice(a, b));
-    } else {
-      const span = el('span', classes.join(' '));
-      span.textContent = text.slice(a, b);
-      node.append(span);
+  // Sweep over mark boundaries (O(n log n), a JSON row can carry thousands of marks); each piece
+  // between two boundaries gets the classes of the marks covering it, in mark order.
+  const len = text.length;
+  const events: Array<[number, number]> = [];
+  marks.forEach((m, k) => {
+    const start = clamp(m.start, 0, len);
+    const end = clamp(m.end, 0, len);
+    if (end > start) events.push([start, k + 1], [end, -(k + 1)]);
+  });
+  events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const active = new Set<number>();
+  let pos = 0;
+  const flush = (to: number): void => {
+    if (to <= pos) return;
+    const piece = text.slice(pos, to);
+    pos = to;
+    if (active.size === 0) {
+      node.append(piece);
+      return;
     }
+    const classes = [...active].sort((a, b) => a - b).map((k) => (marks[k - 1] as Mark).cls);
+    const span = el('span', classes.join(' '));
+    span.textContent = piece;
+    node.append(span);
+  };
+  for (const [at, event] of events) {
+    flush(at);
+    if (event > 0) active.add(event);
+    else active.delete(-event);
   }
+  flush(len);
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): HTMLElementTagNameMap[K] {

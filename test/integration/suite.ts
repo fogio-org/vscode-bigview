@@ -12,6 +12,8 @@ import type { BigViewApi, ExportResult } from '../../src/extension';
 import { formatCount } from '../../src/shared/format';
 import type { FilterMode, HitTarget } from '../../src/shared/protocol';
 import type { FormatInfo } from '../../src/shared/formats';
+import type { JsonTokenColors } from '../../src/core/textmateTheme';
+import { resolveJsonTokenColors } from '../../src/editor/themeColors';
 import { compileQuery, type Query, type SearchQuery } from '../../src/shared/searchQuery';
 import type { GenerateResult } from '../fixtures/generate';
 import { enabledTiers, FIXTURES, loadFixture, type FixtureSpec } from './fixtures';
@@ -31,7 +33,9 @@ const test = (name: string, fn: () => Promise<void>): void => {
 
 export async function run(): Promise<void> {
   let failed = 0;
-  for (const t of tests) {
+  const grep = process.env.BIGVIEW_GREP ? new RegExp(process.env.BIGVIEW_GREP, 'i') : undefined;
+  const selected = grep ? tests.filter((t) => grep.test(t.name)) : tests;
+  for (const t of selected) {
     const started = performance.now();
     try {
       await t.fn();
@@ -43,7 +47,7 @@ export async function run(): Promise<void> {
       await closeAll();
     }
   }
-  if (failed > 0) throw new Error(`${failed} of ${tests.length} integration tests failed`);
+  if (failed > 0) throw new Error(`${failed} of ${selected.length} integration tests failed`);
 }
 
 async function api(): Promise<BigViewApi> {
@@ -579,6 +583,164 @@ test('JSON Lines: field filters match a JSON.parse reference', async () => {
   assert.equal(marker.state.total, gen.markerLines);
   const bad = await runQuery(editor, { kind: 'field', expression: 'level' });
   assert.equal(bad.state.status, 'error');
+});
+
+// ---------------------------------------------------------------------------
+// M6: tail, rotation, errors
+
+const TMP = path.join(ROOT, 'test', '.tmp');
+const tailLine = (i: number, tag = 'main'): string =>
+  `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z INFO  [worker-${i % 9}] ${tag} line ${i}${i % 7 === 3 ? ' NEEDLE_MARKER' : ''}\n`;
+const tailLines = (from: number, to: number, tag?: string): string => {
+  let out = '';
+  for (let i = from; i < to; i++) out += tailLine(i, tag);
+  return out;
+};
+const markersIn = (from: number, to: number): number[] => {
+  const out: number[] = [];
+  for (let i = from; i < to; i++) if (i % 7 === 3) out.push(i);
+  return out;
+};
+
+function writeLog(name: string, content: string): GenerateResult {
+  fs.mkdirSync(TMP, { recursive: true });
+  const file = path.join(TMP, name);
+  fs.rmSync(file, { force: true });
+  fs.writeFileSync(file, content);
+  const lines = content === '' ? 0 : content.split('\n').length - (content.endsWith('\n') ? 1 : 0);
+  return { path: file, bytes: Buffer.byteLength(content), lines, markerLines: 0 };
+}
+
+test('tail: appended lines are indexed and followed at the end; an active filter keeps up', async () => {
+  const gen = writeLog('it-tail.log', tailLines(0, 1000));
+  const { doc, editor } = await open(gen);
+
+  // "all" view scrolled to the end follows new lines
+  editor.reveal(999);
+  // the last row is visible: at max scroll topLine + visibleLines can be lineCount - 1 (partial row)
+  await waitFor(() => editor.topLine + editor.visibleLines >= 999 || undefined, 5000, 'viewport at the end');
+  const t0 = performance.now();
+  fs.appendFileSync(gen.path, tailLines(1000, 1500));
+  await waitFor(() => doc.index.lineCount === 1500 || undefined, 5000, `1500 lines (${doc.index.lineCount})`);
+  console.log(`    tail: +500 lines indexed in ${(performance.now() - t0).toFixed(0)} ms`);
+  assert.equal(doc.index.bytesIndexed, fs.statSync(gen.path).size);
+  assert.equal(doc.index.isComplete, true);
+  await waitFor(() => (editor.rowCount === 1500 && editor.topLine + editor.visibleLines >= 1499) || undefined, 5000, 'webview followed the new lines');
+
+  // a line written in two parts is read whole once complete
+  fs.appendFileSync(gen.path, '2026-01-01T00:00:00.000Z WARN  [worker-1] split');
+  await waitFor(() => doc.index.lineCount === 1501 || undefined, 5000, 'partial line');
+  fs.appendFileSync(gen.path, ` line NEEDLE_MARKER\n${tailLines(1501, 1600)}`);
+  await waitFor(() => doc.index.lineCount === 1600 || undefined, 5000, `1600 lines (${doc.index.lineCount})`);
+  const read = await doc.reader.readLines(1499, 3);
+  assert.deepEqual(read.lines, [tailLine(1499).trimEnd(), '2026-01-01T00:00:00.000Z WARN  [worker-1] split line NEEDLE_MARKER', tailLine(1501).trimEnd()]);
+
+  // search + filter, then growth: hits and filtered rows keep up
+  const { state } = await runSearch(editor, { text: 'NEEDLE_MARKER', caseSensitive: true });
+  const expected0 = [...markersIn(0, 1500), 1500, ...markersIn(1501, 1600)];
+  assert.equal(state.total, expected0.length);
+  await setFilterMode(editor, 'matches');
+  assert.equal(editor.search.viewCount('matches'), expected0.length);
+
+  fs.appendFileSync(gen.path, '2026-01-01T00:00:00.000Z INFO  [worker-2] half NEEDLE');
+  await waitFor(() => doc.index.lineCount === 1601 || undefined, 5000, 'partial marker line');
+  fs.appendFileSync(gen.path, `_MARKER\n${tailLines(1601, 3000)}`);
+  const expected = [...expected0, 1600, ...markersIn(1601, 3000)];
+  await waitFor(() => editor.search.state.total === expected.length || undefined, 10_000,
+    `hits after growth (${editor.search.state.total}/${expected.length})`);
+  assert.deepEqual(editor.search.hitLines(), expected);
+  assert.equal(editor.search.state.status, 'done');
+  assert.equal(editor.search.state.linesSearched, 3000);
+  await waitFor(() => (editor.viewMode === 'matches' && editor.rowCount === expected.length) || undefined, 5000,
+    `filtered rows in the webview (${editor.rowCount}/${expected.length})`);
+  const rows = await editor.search.readView(editor.search.state.searchId, 'matches', expected.length - 3, 3);
+  assert.deepEqual(rows?.lineNumbers, expected.slice(-3));
+});
+
+test('rotation, truncation and deletion re-index the file; the search runs again', async () => {
+  const gen = writeLog('it-rotate.log', tailLines(0, 800));
+  const { doc, editor } = await open(gen);
+  let { state } = await runSearch(editor, { text: 'NEEDLE_MARKER', caseSensitive: true });
+  assert.equal(state.total, markersIn(0, 800).length);
+
+  // logrotate: rename + new file
+  fs.renameSync(gen.path, `${gen.path}.1`);
+  fs.writeFileSync(gen.path, tailLines(0, 300, 'rotated'));
+  await waitFor(() => (doc.resetGeneration === 1 && doc.state === 'ready' && doc.index.lineCount === 300) || undefined, 5000,
+    `re-indexed after rotation (${doc.resetGeneration}, ${doc.state}, ${doc.index.lineCount})`);
+  assert.equal((await doc.reader.readLines(0, 1)).lines[0], tailLine(0, 'rotated').trimEnd());
+  state = await waitFor(() => {
+    const s = editor.search.state;
+    return s.status === 'done' && s.linesSearched === 300 ? s : undefined;
+  }, 5000, 'search after rotation');
+  assert.deepEqual(editor.search.hitLines(), markersIn(0, 300));
+  await waitFor(() => editor.rowCount === 300 || undefined, 5000, `webview rows after rotation (${editor.rowCount})`);
+
+  // copytruncate: same inode, shorter
+  fs.truncateSync(gen.path, 0);
+  fs.appendFileSync(gen.path, tailLines(0, 50, 'truncated'));
+  await waitFor(() => (doc.state === 'ready' && doc.index.lineCount === 50 && doc.index.bytesIndexed === fs.statSync(gen.path).size) || undefined, 5000,
+    `re-indexed after truncation (${doc.index.lineCount})`);
+  assert.equal((await doc.reader.readLines(49, 1)).lines[0], tailLine(49, 'truncated').trimEnd());
+  await waitFor(() => (editor.search.state.status === 'done' && editor.search.state.linesSearched === 50) || undefined, 5000, 'search after truncation');
+  assert.deepEqual(editor.search.hitLines(), markersIn(0, 50));
+
+  // deleted, then created again
+  fs.unlinkSync(gen.path);
+  await waitFor(() => doc.error?.includes('was deleted') || undefined, 5000, 'deletion message');
+  assert.equal((await doc.reader.readLines(0, 1).catch(() => undefined)) !== null, true, 'reading a deleted file must not crash');
+  fs.writeFileSync(gen.path, tailLines(0, 20, 'back'));
+  await waitFor(() => (doc.error === undefined && doc.state === 'ready' && doc.index.lineCount === 20) || undefined, 5000,
+    `file came back (${doc.error}, ${doc.index.lineCount})`);
+  assert.equal((await doc.reader.readLines(0, 1)).lines[0], tailLine(0, 'back').trimEnd());
+  fs.rmSync(`${gen.path}.1`, { force: true });
+});
+
+test('missing, unreadable and binary files are refused with a clear message', async () => {
+  const { provider } = await api();
+  const rejects = async (file: string, pattern: RegExp): Promise<void> => {
+    await assert.rejects(provider.openCustomDocument(vscode.Uri.file(file)), (err: Error) => {
+      assert.match(err.message, pattern);
+      return true;
+    });
+    assert.equal(provider.findDocument(vscode.Uri.file(file)), undefined);
+  };
+  await rejects(path.join(TMP, 'it-missing.log'), /it-missing\.log was not found/);
+
+  const binary = path.join(TMP, 'it-binary.log');
+  fs.writeFileSync(binary, Buffer.concat([Buffer.from('looks like text\n'), Buffer.from([0, 1, 2, 3]), Buffer.from('\nmore\n')]));
+  await rejects(binary, /looks like a binary file/);
+
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    const locked = writeLog('it-locked.log', 'secret\n').path;
+    fs.chmodSync(locked, 0o000);
+    try {
+      await rejects(locked, /Permission denied: cannot open it-locked\.log/);
+    } finally {
+      fs.chmodSync(locked, 0o644);
+    }
+  }
+  await vscode.commands.executeCommand('notifications.clearAll');
+});
+
+test('JSON syntax colors come from the active color theme and its token color customizations', async () => {
+  // Built-in themes chain includes: Dark Modern -> Dark+ -> Dark (Visual Studio).
+  const expected: Record<string, JsonTokenColors> = {
+    'Default Dark Modern': { key: '#9cdcfe', string: '#ce9178', number: '#b5cea8', literal: '#569cd6' },
+    'Default Light Modern': { key: '#0451a5', string: '#a31515', number: '#098658', literal: '#0000ff' },
+  };
+  for (const [theme, colors] of Object.entries(expected)) {
+    assert.deepEqual(await resolveJsonTokenColors(theme, undefined), colors, theme);
+  }
+  // the manifest id without the legacy "Default " prefix works too
+  assert.deepEqual(await resolveJsonTokenColors('Dark Modern', undefined), expected['Default Dark Modern']);
+  const custom = { '[Default Dark Modern]': { numbers: '#123456', textMateRules: [{ scope: 'support.type.property-name.json', settings: { foreground: '#abcdef' } }] } };
+  assert.deepEqual(await resolveJsonTokenColors('Default Dark Modern', custom), {
+    ...expected['Default Dark Modern'],
+    key: '#abcdef',
+    number: '#123456',
+  });
+  assert.deepEqual(await resolveJsonTokenColors('No Such Theme', undefined), {});
 });
 
 if (TIERS.has('large')) {

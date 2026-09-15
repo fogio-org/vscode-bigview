@@ -46,6 +46,9 @@ export interface SearchOptions {
   overlapBytes?: number;
   progressBytes?: number;
   decodeBytes?: number;
+  /** Continue a search: start at this byte offset, which must be the start of `startLine`. */
+  startOffset?: number;
+  startLine?: number;
 }
 
 export interface SearchSummary {
@@ -252,15 +255,15 @@ export function searchFile(
   const buf = Buffer.allocUnsafe(Math.max(1, Math.min(chunkBytes, fileSize)));
   const emit = (line: number): void => sink.hit(line);
 
-  let nextProgress = progressBytes;
+  let start = Math.max(0, Math.floor(opts.startOffset ?? 0));
+  let line = Math.max(0, Math.floor(opts.startLine ?? 0));
+  let nextProgress = (Math.floor(start / progressBytes) + 1) * progressBytes;
   const report = (pos: number, lines: number): void => {
     if (pos < nextProgress) return;
     sink.progress(pos, lines);
     nextProgress = (Math.floor(pos / progressBytes) + 1) * progressBytes;
   };
 
-  let start = 0;
-  let line = 0;
   while (start < fileSize) {
     if (sink.isCancelled(start, line)) return { status: 'cancelled', bytesSearched: start, lineCount: line };
     const want = Math.min(buf.length, fileSize - start);

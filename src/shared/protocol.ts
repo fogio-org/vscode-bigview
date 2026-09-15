@@ -2,6 +2,7 @@
  * Typed messages between the webview and the extension host (SPEC §3.6).
  * Never send large payloads in one message.
  */
+import type { JsonTokenKind } from '../formats/jsonHighlight';
 import type { IndexSource } from './format';
 import type { FormatInfo, FormatKind } from './formats';
 import type { Query, Range } from './searchQuery';
@@ -49,7 +50,11 @@ export type HostToWebview =
       fileSize: number;
       done: boolean;
       source: IndexSource;
+      /** Lines were appended to the file since the previous update (tail -f). */
+      tail: boolean;
     }
+  /** The file was replaced (rotation, truncation): drop everything shown and search again. */
+  | { type: 'reset' }
   | {
       type: 'lines';
       reqId: number;
@@ -98,6 +103,8 @@ export type HostToWebview =
   | { type: 'setQuery'; query: Query }
   /** The file format (detected or chosen by the user). */
   | { type: 'format'; format: FormatInfo }
+  /** JSON token colors of the active color theme (JSON Lines syntax highlighting). */
+  | { type: 'theme'; json: Partial<Record<JsonTokenKind, string>> }
   | { type: 'lineText'; reqId: number; line: number; text: string; truncated: boolean; error?: string }
   /** Switches the filter as if the Filter/Invert buttons were used. */
   | { type: 'setFilterMode'; mode: FilterMode };

@@ -76,6 +76,8 @@ export class SearchController implements vscode.Disposable {
   private regex: RegExp | undefined;
   private filterMode: FilterMode = 'all';
   private startedAt = 0;
+  /** The file grew while a search was running: continue it afterwards. */
+  private tailPending = false;
   private postTimer: NodeJS.Timeout | undefined;
   private current = idle(0);
   private readonly reader: ChunkReader;
@@ -107,6 +109,7 @@ export class SearchController implements vscode.Disposable {
 
   start(searchId: number, query: Query, mode: FilterMode = 'all'): void {
     this.stopTask();
+    this.tailPending = false;
     const hits = new LineSet();
     this.hits = hits;
     this.regex = undefined;
@@ -152,6 +155,7 @@ export class SearchController implements vscode.Disposable {
           },
           true,
         );
+        this.continueTail();
       },
       (err: unknown) => {
         if (this.task !== task) return;
@@ -161,8 +165,77 @@ export class SearchController implements vscode.Disposable {
     );
   }
 
-  /** Forgets the current search (the webview reloaded). */
+  /**
+   * Lines were appended to the file (tail): search just the new part so hits, the filter view and
+   * export keep up with a growing log. The status stays "done" meanwhile.
+   */
+  onFileGrew(): void {
+    const s = this.current;
+    if (!s.query || s.status === 'idle' || s.status === 'error') return;
+    if (this.task) {
+      this.tailPending = true;
+      return;
+    }
+    void this.searchAppended();
+  }
+
+  private continueTail(): void {
+    if (!this.tailPending) return;
+    this.tailPending = false;
+    void this.searchAppended();
+  }
+
+  private async searchAppended(): Promise<void> {
+    const s = this.current;
+    const query = s.query;
+    const searchId = s.searchId;
+    if (!query || s.bytesSearched >= this.doc.index.bytesIndexed) return;
+    // An incomplete last line may have grown: search it again.
+    let startLine = s.linesSearched;
+    let startOffset = s.bytesSearched;
+    if (s.linesSearched > 0 && !(await this.doc.startsLine(s.bytesSearched))) {
+      startLine = s.linesSearched - 1;
+      startOffset = await this.reader.lineStart(startLine);
+    }
+    if (searchId !== this.current.searchId || this.task) return;
+    const hits = this.hits;
+    this.worker ??= this.createWorker();
+    const task = this.worker.search(
+      this.doc.uri.fsPath,
+      query,
+      {
+        onProgress: (lines, bytesSearched, fileSize, linesSearched) => {
+          if (this.task !== task) return;
+          hits.addAll(lines);
+          this.patch({ total: hits.size, bytesSearched, fileSize, linesSearched }, false);
+        },
+      },
+      { startOffset, startLine },
+    );
+    this.task = task;
+    task.result.then(
+      (outcome) => {
+        if (this.task !== task) return;
+        this.task = undefined;
+        if (outcome.status === 'done') {
+          this.patch(
+            { total: hits.size, bytesSearched: outcome.bytesSearched, linesSearched: outcome.lineCount, fileSize: outcome.fileSize },
+            true,
+          );
+        }
+        this.continueTail();
+      },
+      (err: unknown) => {
+        if (this.task !== task) return;
+        this.task = undefined;
+        this.patch({ status: 'error', error: messageOf(err) }, true);
+      },
+    );
+  }
+
+  /** Forgets the current search (the webview reloaded, or the file was replaced). */
   reset(): void {
+    this.tailPending = false;
     this.stopTask();
     this.hits = new LineSet();
     this.regex = undefined;

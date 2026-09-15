@@ -1,4 +1,5 @@
 import { parseDsvLine } from '../src/formats/dsvFormat';
+import { jsonTokens, type JsonTokenKind } from '../src/formats/jsonHighlight';
 import { fieldValueText, flattenJson, parseJsonLine, type JsonValue } from '../src/formats/jsonlFormat';
 import { detectLevel, parseTimestamp } from '../src/formats/logFormat';
 import { formatBytes, formatCount } from '../src/shared/format';
@@ -7,7 +8,7 @@ import type { FilterMode, HitTarget, HostToWebview, SearchResultItem, WebviewToH
 import { compileQuery, findRanges, isEmptyQuery, isTextQuery, type Query } from '../src/shared/searchQuery';
 import { SearchBar } from './SearchBar';
 import './styles.css';
-import { VirtualList, type Mark, type RowData } from './VirtualList';
+import { appendMarked, VirtualList, type Mark, type RowData } from './VirtualList';
 
 interface VsCodeApi {
   postMessage(msg: WebviewToHost): void;
@@ -49,6 +50,7 @@ const MIN_AUTO_COLUMN_PX = 60;
 const MAX_AUTO_COLUMN_PX = 420;
 const DETAIL_FIELDS = 500;
 const DETAIL_JSON_CHARS = 200_000;
+const DETAIL_JSON_TOKENS = 50_000;
 const YEAR = new Date().getUTCFullYear();
 
 const vscode = acquireVsCodeApi();
@@ -156,6 +158,25 @@ function evict<T>(cache: Map<number, T>, max: number, center: number, radius: nu
   }
 }
 
+const JSON_TOKEN_CLASS: Record<JsonTokenKind, string> = {
+  key: 'json-key',
+  string: 'json-string',
+  number: 'json-number',
+  literal: 'json-literal',
+};
+
+function jsonMarks(text: string, maxTokens?: number): Mark[] {
+  return jsonTokens(text, maxTokens).map((t) => ({ start: t.start, end: t.end, cls: JSON_TOKEN_CLASS[t.kind] }));
+}
+
+/** Class for a field value in the details panel, by JSON type. */
+function jsonValueClass(value: JsonValue): string {
+  if (typeof value === 'string') return ' json-string';
+  if (typeof value === 'number') return ' json-number';
+  if (typeof value === 'boolean' || value === null) return ' json-literal';
+  return '';
+}
+
 /** Search highlights and format decorations of a row (computed once per decorVersion). */
 function decorate(entry: CachedLine): void {
   entry.ranges = searchRegex ? findRanges(entry.text, searchRegex) : undefined;
@@ -183,6 +204,12 @@ function decorate(entry: CachedLine): void {
       const regex = searchRegex;
       if (regex) entry.cellRanges = cells.map((cell) => findRanges(cell, regex));
       if (entry.lineNumber === 0) entry.cls = 'dsv-header-row';
+      break;
+    }
+    case 'jsonl': {
+      // Syntax colors for rows that look like JSON; other lines stay plain.
+      const first = entry.text.trimStart().charCodeAt(0);
+      if (first === 0x7b || first === 0x5b) entry.marks = jsonMarks(entry.text);
       break;
     }
     default:
@@ -465,7 +492,7 @@ function renderDetails(msg: Extract<HostToWebview, { type: 'lineText' }>): void 
     const row = el('div', 'dt-field');
     const path = el('span', 'dt-path');
     path.textContent = field.path || '(value)';
-    const value = el('span', 'dt-value');
+    const value = el('span', `dt-value${jsonValueClass(field.value)}`);
     const text = fieldValueText(field.value);
     value.textContent = text;
     row.title = `${field.path} = ${text.slice(0, 1000)}\nClick to filter by this value`;
@@ -483,7 +510,8 @@ function renderDetails(msg: Extract<HostToWebview, { type: 'lineText' }>): void 
   if (fields.length > DETAIL_FIELDS) detailsEl.append(note(`Showing the first ${DETAIL_FIELDS} fields`));
   const pretty = el('pre', 'dt-json');
   const json = JSON.stringify(parsed.value, null, 2);
-  pretty.textContent = json.length > DETAIL_JSON_CHARS ? `${json.slice(0, DETAIL_JSON_CHARS)}\n…` : json;
+  const shown = json.length > DETAIL_JSON_CHARS ? `${json.slice(0, DETAIL_JSON_CHARS)}\n…` : json;
+  appendMarked(pretty, shown, jsonMarks(shown, DETAIL_JSON_TOKENS));
   detailsEl.append(pretty);
 }
 
@@ -662,21 +690,47 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       fileSize = msg.fileSize;
       renderFileInfo();
       break;
-    case 'index':
+    case 'index': {
+      // tail -f: follow new lines if the last row was visible
+      const follow = msg.tail && viewMode === 'all' && list.isAtEnd;
+      if (msg.tail && viewMode === 'all' && lineCount > 0) {
+        // The last line may have been incomplete: read it again.
+        lineCache.delete(lineCount - 1);
+        pendingLineBlocks.delete(Math.floor((lineCount - 1) / LINE_BLOCK));
+      }
+      const prevCount = lineCount;
+      if (msg.fileSize !== fileSize) {
+        fileSize = msg.fileSize; // grows with tail
+        renderFileInfo();
+      }
       indexInfo = msg;
       lineCount = msg.lineCount;
       list.setGutterMax(Math.max(1, msg.lineCount));
       results.setGutterMax(Math.max(1, msg.lineCount));
       if (format.kind === 'dsv') alignTableHeader();
-      if (viewMode === 'all') list.setCount(msg.lineCount);
+      if (viewMode === 'all') {
+        list.setCount(msg.lineCount);
+        if (follow) list.scrollToEnd();
+        // Report the new row count even without scrolling (tail, re-index after rotation).
+        if (prevCount !== msg.lineCount) scheduleViewport(msg.tail || msg.done);
+      }
       renderHeader();
       if (restoreLine > 0 && viewMode === 'all' && (msg.lineCount > restoreLine || msg.done)) {
         list.scrollToLine(restoreLine);
         restoreLine = 0;
       }
       break;
+    }
     case 'format':
       applyFormat(msg.format);
+      break;
+    case 'theme':
+      // Editor JSON token colors; styles.css falls back to debug token colors without them.
+      for (const kind of ['key', 'string', 'number', 'literal'] as const) {
+        const color = msg.json[kind];
+        if (color) document.documentElement.style.setProperty(`--bv-json-${kind}`, color);
+        else document.documentElement.style.removeProperty(`--bv-json-${kind}`);
+      }
       break;
     case 'lines': {
       if (msg.viewId !== viewId) break;
@@ -704,14 +758,32 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       errorEl.textContent = msg.message;
       errorEl.hidden = false;
       break;
-    case 'searchState':
+    case 'reset':
+      // The file was replaced (e.g. log rotation): everything shown is stale.
+      errorEl.hidden = true;
+      viewId++;
+      lineCache.clear();
+      pendingLineBlocks.clear();
+      resultCache.clear();
+      pendingResultBlocks.clear();
+      list.refresh();
+      list.setHighlight(-1);
+      if (hasQuery()) startSearch(bar.value, false);
+      break;
+    case 'searchState': {
       if (msg.searchId !== searchId) break;
+      // Rows added after the search had finished come from tail: follow them like the full view.
+      const settled = searchState?.status === 'done';
       searchState = msg;
       results.setCount(msg.total);
       results.invalidate();
       if (viewMode !== 'all' && msg.mode === viewMode && pendingFilter === undefined && msg.viewCount !== viewCount) {
+        const follow = settled && list.isAtEnd;
+        if (settled && viewCount > 0) lineCache.delete(viewCount - 1);
         viewCount = msg.viewCount;
         list.setCount(viewCount);
+        if (follow) list.scrollToEnd();
+        scheduleViewport(msg.status === 'done');
         list.invalidate();
         scheduleViewport(true);
       }
@@ -723,6 +795,7 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
       renderSearchStatus();
       renderHeader();
       break;
+    }
     case 'results':
       if (msg.searchId !== searchId) break;
       msg.items.forEach((item, k) => resultCache.set(msg.start + k, item));

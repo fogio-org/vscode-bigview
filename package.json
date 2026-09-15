@@ -1,10 +1,44 @@
 {
   "name": "bigview",
   "displayName": "BigView",
-  "description": "View and search huge log, JSONL and CSV files without loading them into memory.",
-  "version": "0.0.1",
+  "description": "View, search, filter and tail huge log, JSON Lines and CSV files (gigabytes) without loading them into memory.",
+  "version": "0.1.0",
   "publisher": "fogio",
+  "license": "MIT",
   "private": true,
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fogio-org/vscode-bigview.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fogio-org/vscode-bigview/issues"
+  },
+  "homepage": "https://github.com/fogio-org/vscode-bigview#readme",
+  "categories": [
+    "Visualization",
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "large file",
+    "big file",
+    "log viewer",
+    "log",
+    "tail",
+    "jsonl",
+    "ndjson",
+    "csv",
+    "tsv",
+    "viewer",
+    "search",
+    "filter",
+    "grep"
+  ],
+  "galleryBanner": {
+    "color": "#1b2440",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -15,11 +49,21 @@
         "viewType": "bigview.viewer",
         "displayName": "BigView",
         "selector": [
-          { "filenamePattern": "*.log" },
-          { "filenamePattern": "*.jsonl" },
-          { "filenamePattern": "*.ndjson" },
-          { "filenamePattern": "*.csv" },
-          { "filenamePattern": "*.tsv" }
+          {
+            "filenamePattern": "*.log"
+          },
+          {
+            "filenamePattern": "*.jsonl"
+          },
+          {
+            "filenamePattern": "*.ndjson"
+          },
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.tsv"
+          }
         ],
         "priority": "default"
       }
@@ -171,6 +215,7 @@
     "@types/node": "^22.20.2",
     "@types/vscode": "~1.90.0",
     "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.2",
     "eslint": "^10.10.0",
     "tsx": "^4.23.13",

@@ -301,7 +301,8 @@ export class SearchWorker {
     return this.worker !== undefined;
   }
 
-  search(filePath: string, query: Query, callbacks: SearchCallbacks): SearchTask {
+  /** Searches the whole file, or from `range` on (continuing a search after the file grew). */
+  search(filePath: string, query: Query, callbacks: SearchCallbacks, range?: { startOffset: number; startLine: number }): SearchTask {
     if (this.disposed) throw new Error('SearchWorker is disposed');
     this.cancelCurrent();
     const id = this.nextId++;
@@ -318,6 +319,8 @@ export class SearchWorker {
         id,
         filePath,
         query,
+        startOffset: range?.startOffset,
+        startLine: range?.startLine,
         chunkBytes: this.opts.chunkBytes,
         overlapBytes: this.opts.overlapBytes,
         progressBytes: this.opts.progressBytes,

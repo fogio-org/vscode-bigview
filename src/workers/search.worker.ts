@@ -35,8 +35,8 @@ function run(req: SearchRequest): void {
     let count = 0;
     let lastFlush = performance.now();
     // Position at the last chunk boundary: all hits below linesSearched are already found.
-    let bytesSearched = 0;
-    let linesSearched = 0;
+    let bytesSearched = req.startOffset ?? 0;
+    let linesSearched = req.startLine ?? 0;
     const take = (): Float64Array => {
       const out = pending.slice(0, count);
       count = 0;

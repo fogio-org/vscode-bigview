@@ -3,10 +3,12 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import htmlTemplate from '../../webview/index.html';
+import { BINARY_SAMPLE_BYTES, looksBinary } from '../core/binary';
 import { ChunkReader, type ChunkReaderOptions } from '../core/ChunkReader';
+import { describeFsError, isStorageError } from '../core/errors';
 import type { FileHandlePool } from '../core/FileHandlePool';
 import { restoreLineIndex, type IndexStore } from '../core/IndexStore';
-import { LineIndex } from '../core/LineIndex';
+import { LineIndex, LineStartScanner } from '../core/LineIndex';
 import { FREE_FILE_SIZE_LIMIT, isPro } from '../license';
 import type { IndexSource, IndexState, StatusInfo } from '../shared/format';
 import { detectFormat, type FormatChoice, type FormatInfo, type FormatKind } from '../shared/formats';
@@ -21,6 +23,8 @@ import {
 import type { Query } from '../shared/searchQuery';
 import type { IndexOutcome, WorkerPool } from '../workers/workerPool';
 import { SearchController } from './SearchController';
+import { jsonTokenColors } from './themeColors';
+import { snapshotOf, TailWatcher, type FileSnapshot } from './TailWatcher';
 
 /** Remembers the format chosen by the user per file. */
 export interface FormatStore {
@@ -33,15 +37,22 @@ export interface DocumentDeps {
   workers: WorkerPool;
   store: IndexStore;
   formats: FormatStore;
+  /** Stat poll interval of the tail watcher. */
+  tailPollMs?: number;
 }
 
 /** Lines sampled for format detection (SPEC §5 formats.ts). */
 const FORMAT_SAMPLE_LINES = 50;
+/** Appends larger than this are indexed by a full rebuild in the worker instead of on the host. */
+const TAIL_MAX_APPEND_BYTES = 64 * 1024 * 1024;
+const TAIL_READ_BYTES = 1024 * 1024;
+
+let warnedAboutIndexCache = false;
 
 export class BigViewDocument implements vscode.CustomDocument {
   readonly index: LineIndex;
   readonly reader: ChunkReader;
-  readonly source: IndexSource;
+  source: IndexSource;
   state: IndexState;
   error: string | undefined;
   fileSize: number;
@@ -50,39 +61,74 @@ export class BigViewDocument implements vscode.CustomDocument {
   readyAt: number | undefined;
   /** Time the first batch of lines was sent to a webview (for first-render metrics). */
   firstLinesAt: number | undefined;
-  /** Resolves when indexing ends (check `state`). */
+  /** Resolves when the first indexing ends (check `state`). */
   readonly indexed: Promise<void>;
   /** Resolves after a freshly built index was written to disk (or skipped / failed). */
   readonly persisted: Promise<void>;
   persistError: string | undefined;
   /** Undefined until the first lines are available. */
   format: FormatInfo | undefined;
+  /** Incremented each time lines appended to the file were added to the index (tail). */
+  tailGeneration = 0;
+  /** Incremented each time the index was rebuilt because the file was replaced. */
+  resetGeneration = 0;
+
   private formatOverride: FormatChoice | undefined;
   private formatGeneration = 0;
-
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChange = this.changeEmitter.event;
+  private readonly resetEmitter = new vscode.EventEmitter<void>();
+  /** The file was replaced (rotation, truncation): everything derived from its lines is stale. */
+  readonly onDidReset = this.resetEmitter.event;
   private cancelIndexing: () => void = () => undefined;
+  private fileIno: number;
+  private deleted = false;
+  private disposed = false;
+  private watcher: TailWatcher | undefined;
+  /** File changes are handled one at a time. */
+  private queue: Promise<void> = Promise.resolve();
 
   static async open(uri: vscode.Uri, deps: DocumentDeps, onDispose: () => void): Promise<BigViewDocument> {
     if (uri.scheme !== 'file') throw new Error('BigView supports local files only.');
-    const stat = await fsp.stat(uri.fsPath);
-    if (!stat.isFile()) throw new Error(`${uri.fsPath} is not a regular file.`);
+    const filePath = uri.fsPath;
+    let stat;
+    try {
+      stat = await fsp.stat(filePath);
+    } catch (err) {
+      throw new Error(describeFsError(err, filePath, 'open'));
+    }
+    if (!stat.isFile()) throw new Error(`${path.basename(filePath)} is not a regular file.`);
     if (stat.size > FREE_FILE_SIZE_LIMIT && !isPro()) {
       throw new Error('Files larger than 200 MB require BigView Pro.');
     }
-    const cached = await restoreLineIndex(deps.store, deps.pool, uri.fsPath, stat);
-    return new BigViewDocument(uri, stat.size, cached, deps, onDispose);
+    let head: Buffer;
+    try {
+      head = await deps.pool.read(filePath, 0, Math.min(stat.size, BINARY_SAMPLE_BYTES));
+    } catch (err) {
+      deps.pool.close(filePath);
+      throw new Error(describeFsError(err, filePath, 'open'));
+    }
+    if (looksBinary(head)) {
+      deps.pool.close(filePath);
+      const message = `${path.basename(filePath)} looks like a binary file (it contains NUL bytes). BigView shows text files only.`;
+      void vscode.window.showWarningMessage(message, 'Open in Text Editor').then((choice) => {
+        if (choice) void vscode.commands.executeCommand('vscode.openWith', uri, 'default');
+      });
+      throw new Error(message);
+    }
+    const cached = await restoreLineIndex(deps.store, deps.pool, filePath, stat);
+    return new BigViewDocument(uri, { size: stat.size, ino: stat.ino }, cached, deps, onDispose);
   }
 
   private constructor(
     readonly uri: vscode.Uri,
-    fileSize: number,
+    stat: { size: number; ino: number },
     cached: LineIndex | undefined,
     private readonly deps: DocumentDeps,
     private readonly onDispose: () => void,
   ) {
-    this.fileSize = fileSize;
+    this.fileSize = stat.size;
+    this.fileIno = stat.ino;
     this.formatOverride = deps.formats.get(uri.fsPath);
     this.index = cached ?? new LineIndex();
     this.source = cached ? 'cache' : 'scan';
@@ -93,35 +139,14 @@ export class BigViewDocument implements vscode.CustomDocument {
       this.readyAt = performance.now();
       this.indexed = Promise.resolve();
       this.persisted = Promise.resolve();
-      void this.detectFormat();
-      return;
+    } else {
+      this.state = 'indexing';
+      const outcome = this.runIndexer();
+      this.indexed = outcome.then(() => undefined);
+      this.persisted = outcome.then((o) => (o?.status === 'done' ? this.persist(o) : undefined));
     }
-
-    this.state = 'indexing';
-    const task = deps.workers.index(uri.fsPath, this.index, (size) => {
-      this.fileSize = size;
-      this.changeEmitter.fire();
-    });
-    this.cancelIndexing = () => task.cancel();
-    const outcome = task.result.then(
-      (o) => {
-        if (o.status === 'done') {
-          this.state = 'ready';
-          this.readyAt = performance.now();
-        }
-        this.changeEmitter.fire();
-        return o;
-      },
-      (err: unknown) => {
-        this.state = 'failed';
-        this.error = `Indexing failed: ${err instanceof Error ? err.message : String(err)}`;
-        this.changeEmitter.fire();
-        return undefined;
-      },
-    );
-    this.indexed = outcome.then(() => undefined);
-    this.persisted = outcome.then((o) => (o?.status === 'done' ? this.persist(o) : undefined));
     void this.detectFormat();
+    void this.indexed.then(() => this.startWatching());
   }
 
   get status(): StatusInfo {
@@ -143,6 +168,13 @@ export class BigViewDocument implements vscode.CustomDocument {
     return this.deps.workers.createSearchWorker();
   }
 
+  /** Whether the byte before `offset` is `\n` (i.e. `offset` starts a line). */
+  async startsLine(offset: number): Promise<boolean> {
+    if (offset <= 0) return true;
+    const b = await this.deps.pool.read(this.uri.fsPath, offset - 1, 1);
+    return b[0] === 0x0a;
+  }
+
   /** Sets (or with undefined, clears) the user's format choice; remembered per file. */
   async setFormat(choice: FormatChoice | undefined): Promise<FormatInfo | undefined> {
     this.formatOverride = choice;
@@ -150,6 +182,146 @@ export class BigViewDocument implements vscode.CustomDocument {
     await this.detectFormat();
     return this.format;
   }
+
+  dispose(): void {
+    this.disposed = true;
+    this.watcher?.dispose();
+    this.cancelIndexing();
+    this.deps.pool.close(this.uri.fsPath);
+    this.changeEmitter.dispose();
+    this.resetEmitter.dispose();
+    this.onDispose();
+  }
+
+  // ---- indexing ----
+
+  private runIndexer(): Promise<IndexOutcome | undefined> {
+    const filePath = this.uri.fsPath;
+    const task = this.deps.workers.index(filePath, this.index, (size) => {
+      this.fileSize = size;
+      this.changeEmitter.fire();
+    });
+    this.cancelIndexing = () => task.cancel();
+    return task.result.then(
+      (o) => {
+        if (o.status === 'done') {
+          this.state = 'ready';
+          this.readyAt = performance.now();
+          this.fileSize = o.fileSize;
+        }
+        this.changeEmitter.fire();
+        return o;
+      },
+      (err: unknown) => {
+        this.state = 'failed';
+        this.error = `Indexing failed. ${describeFsError(err, filePath, 'read')}`;
+        this.changeEmitter.fire();
+        return undefined;
+      },
+    );
+  }
+
+  private async persist(o: Extract<IndexOutcome, { status: 'done' }>): Promise<void> {
+    try {
+      // Do not cache an index of a file that changed while it was being scanned.
+      const now = await fsp.stat(this.uri.fsPath);
+      if (now.size !== o.fileSize || now.mtimeMs !== o.mtimeMs) return;
+      await this.deps.store.save(this.uri.fsPath, {
+        fileSize: o.fileSize,
+        mtimeMs: o.mtimeMs,
+        stride: this.index.stride,
+        anchors: this.index.toFloat64Array(),
+      });
+    } catch (err) {
+      this.persistError = describeFsError(err, this.deps.store.pathFor(this.uri.fsPath), 'write');
+      if (isStorageError(err) && !warnedAboutIndexCache) {
+        warnedAboutIndexCache = true;
+        void vscode.window.showWarningMessage(
+          `BigView could not save its index cache. ${this.persistError} Files stay usable but are indexed again each time they are opened.`,
+        );
+      }
+    }
+  }
+
+  // ---- tail -f and rotation (SPEC §6 M6) ----
+
+  private startWatching(): void {
+    // Tail is a future Pro feature (SPEC §3.9).
+    if (this.disposed || !isPro()) return;
+    this.watcher = new TailWatcher(this.uri.fsPath, (snap) => this.enqueue(() => this.sync(snap)), this.deps.tailPollMs);
+    // The file may have changed while it was being indexed.
+    this.enqueue(async () => this.sync(await snapshotOf(this.uri.fsPath)));
+  }
+
+  private enqueue(task: () => Promise<void>): void {
+    this.queue = this.queue.then(task).catch((err: unknown) => {
+      if (this.disposed) return;
+      this.error = describeFsError(err, this.uri.fsPath, 'read');
+      this.changeEmitter.fire();
+    });
+  }
+
+  private async sync(snap: FileSnapshot | undefined): Promise<void> {
+    if (this.disposed || this.state === 'indexing') return;
+    if (!snap) {
+      if (!this.deleted) {
+        this.deleted = true;
+        this.error = `${path.basename(this.uri.fsPath)} was deleted or moved. BigView reloads it if it comes back.`;
+        this.changeEmitter.fire();
+      }
+      return;
+    }
+    const replaced = this.deleted || snap.ino !== this.fileIno || snap.size < this.index.bytesIndexed || this.state === 'failed';
+    if (replaced || snap.size - this.index.bytesIndexed > TAIL_MAX_APPEND_BYTES) {
+      await this.reindex(snap);
+    } else if (snap.size > this.index.bytesIndexed) {
+      await this.extend(snap.size);
+    }
+  }
+
+  /** Indexes the bytes appended after the indexed part. */
+  private async extend(newSize: number): Promise<void> {
+    const filePath = this.uri.fsPath;
+    const from = this.index.bytesIndexed;
+    const terminated = await this.startsLine(from);
+    const scanner = new LineStartScanner({ resume: this.index.resumeState(terminated) });
+    let pos = from;
+    let lastByte = terminated ? 0x0a : -1;
+    while (pos < newSize) {
+      const buf = await this.deps.pool.read(filePath, pos, Math.min(TAIL_READ_BYTES, newSize - pos));
+      if (buf.length === 0 || this.disposed) break;
+      scanner.scan(buf);
+      lastByte = buf[buf.length - 1] as number;
+      pos += buf.length;
+    }
+    if (pos === from || this.disposed) return;
+    const lineCount = lastByte === 0x0a ? scanner.linesStarted - 1 : scanner.linesStarted;
+    this.index.extend(scanner.take(), { stride: scanner.stride, linesStarted: scanner.linesStarted, bytesIndexed: pos, lineCount });
+    this.fileSize = pos;
+    this.tailGeneration++;
+    this.changeEmitter.fire();
+  }
+
+  /** Rebuilds the index from scratch: the file was truncated, replaced, recreated or grew a lot. */
+  private async reindex(snap: FileSnapshot): Promise<void> {
+    this.cancelIndexing();
+    this.deleted = false;
+    this.error = undefined;
+    this.fileIno = snap.ino;
+    this.fileSize = snap.size;
+    this.deps.pool.close(this.uri.fsPath); // a cached handle may still point at the old file
+    this.index.reset();
+    this.state = 'indexing';
+    this.source = 'scan';
+    this.readyAt = undefined;
+    this.resetGeneration++;
+    this.resetEmitter.fire();
+    this.changeEmitter.fire();
+    const outcome = await this.runIndexer();
+    if (outcome?.status === 'done') void this.persist(outcome);
+  }
+
+  // ---- format ----
 
   private async detectFormat(): Promise<void> {
     const generation = ++this.formatGeneration;
@@ -160,7 +332,7 @@ export class BigViewDocument implements vscode.CustomDocument {
     } catch {
       // unreadable: fall back to plain text
     }
-    if (generation !== this.formatGeneration) return;
+    if (generation !== this.formatGeneration || this.disposed) return;
     this.format = detectFormat(path.basename(this.uri.fsPath), sample, this.formatOverride);
     this.changeEmitter.fire();
   }
@@ -179,30 +351,6 @@ export class BigViewDocument implements vscode.CustomDocument {
         }
       });
     });
-  }
-
-  dispose(): void {
-    this.cancelIndexing();
-    this.deps.pool.close(this.uri.fsPath);
-    this.changeEmitter.dispose();
-    this.onDispose();
-  }
-
-  private async persist(o: Extract<IndexOutcome, { status: 'done' }>): Promise<void> {
-    try {
-      // Do not cache an index of a file that changed while it was being scanned.
-      const now = await fsp.stat(this.uri.fsPath);
-      if (now.size !== o.fileSize || now.mtimeMs !== o.mtimeMs) return;
-      await this.deps.store.save(this.uri.fsPath, {
-        fileSize: o.fileSize,
-        mtimeMs: o.mtimeMs,
-        stride: this.index.stride,
-        anchors: this.index.toFloat64Array(),
-      });
-    } catch (err) {
-      // User-facing reporting (e.g. disk full) comes with M6.
-      this.persistError = String(err);
-    }
   }
 }
 
@@ -275,10 +423,18 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
     let ready = false;
     let pendingReveal: number | undefined;
     let lastFormat: FormatInfo | undefined;
+    let lastTail = doc.tailGeneration;
     const post = (msg: HostToWebview): void => {
       if (ready) void webview.postMessage(msg);
     };
+
+    const viewportEmitter = new vscode.EventEmitter<void>();
+    const search = new SearchController(doc, () => doc.createSearchWorker(), post);
+
     const postState = (): void => {
+      const tail = doc.tailGeneration !== lastTail;
+      lastTail = doc.tailGeneration;
+      if (tail) search.onFileGrew();
       post({
         type: 'index',
         lineCount: doc.index.lineCount,
@@ -286,6 +442,7 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
         fileSize: doc.fileSize,
         done: doc.index.isComplete,
         source: doc.source,
+        tail,
       });
       if (doc.error) post({ type: 'error', message: doc.error });
       if (ready && doc.format && doc.format !== lastFormat) {
@@ -294,8 +451,9 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
       }
     };
 
-    const viewportEmitter = new vscode.EventEmitter<void>();
-    const search = new SearchController(doc, () => doc.createSearchWorker(), post);
+    const postTheme = (): void => {
+      void jsonTokenColors().then((json) => post({ type: 'theme', json }));
+    };
 
     const postReveal = (line: number): void =>
       post({ type: 'reveal', line, viewIndex: search.viewIndexOfLine(line), mode: search.mode });
@@ -322,9 +480,11 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
           case 'ready':
             ready = true; // (re)sent whenever the webview (re)loads
             lastFormat = undefined;
+            lastTail = doc.tailGeneration;
             search.reset();
             post({ type: 'init', fileName: path.basename(doc.uri.fsPath), fileSize: doc.fileSize });
             postState();
+            postTheme();
             if (pendingReveal !== undefined) postReveal(pendingReveal);
             pendingReveal = undefined;
             break;
@@ -339,7 +499,7 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
                 doc.firstLinesAt ??= performance.now();
                 post({ type: 'lines', reqId: msg.reqId, viewId: msg.viewId, start: res.start, lines: res.lines, truncated: res.truncated });
               },
-              (err: unknown) => post({ type: 'error', message: `Read failed: ${String(err)}` }),
+              (err: unknown) => post({ type: 'error', message: describeFsError(err, doc.uri.fsPath, 'read') }),
             );
             break;
           }
@@ -358,7 +518,14 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
             doc.reader.readLineText(msg.line, MAX_DETAIL_BYTES).then(
               (r) => post({ type: 'lineText', reqId: msg.reqId, line: msg.line, text: r.text, truncated: r.truncated }),
               (err: unknown) =>
-                post({ type: 'lineText', reqId: msg.reqId, line: msg.line, text: '', truncated: false, error: String(err) }),
+                post({
+                  type: 'lineText',
+                  reqId: msg.reqId,
+                  line: msg.line,
+                  text: '',
+                  truncated: false,
+                  error: describeFsError(err, doc.uri.fsPath, 'read'),
+                }),
             );
             break;
           case 'setFilter':
@@ -379,6 +546,15 @@ export class BigViewProvider implements vscode.CustomReadonlyEditorProvider<BigV
       viewportEmitter,
       search,
       doc.onDidChange(postState),
+      vscode.window.onDidChangeActiveColorTheme(postTheme),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('workbench.colorTheme') || e.affectsConfiguration('editor.tokenColorCustomizations')) postTheme();
+      }),
+      doc.onDidReset(() => {
+        search.reset();
+        lastTail = doc.tailGeneration;
+        post({ type: 'reset' });
+      }),
       panel.onDidChangeViewState(() => {
         if (panel.active) this.setActive(editor);
         else if (this.activeEditor === editor) this.setActive(undefined);

@@ -47,6 +47,9 @@ export interface SearchRequest {
   id: number;
   filePath: string;
   query: Query;
+  /** Continue from here (tail): byte offset of the start of `startLine`. */
+  startOffset?: number;
+  startLine?: number;
   chunkBytes?: number;
   overlapBytes?: number;
   progressBytes?: number;

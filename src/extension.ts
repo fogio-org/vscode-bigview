@@ -1,6 +1,7 @@
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { describeFsError } from './core/errors';
 import { FileHandlePool } from './core/FileHandlePool';
 import { IndexStore } from './core/IndexStore';
 import { BigViewProvider } from './editor/BigViewProvider';
@@ -236,7 +237,7 @@ async function exportFiltered(provider: BigViewProvider, workers: WorkerPool, ta
     );
   } catch (err) {
     await fsp.rm(destPath, { force: true });
-    void vscode.window.showErrorMessage(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    void vscode.window.showErrorMessage(`Export failed. ${describeFsError(err, destPath, 'export')}`);
     return undefined;
   }
   if (outcome.status === 'cancelled') {

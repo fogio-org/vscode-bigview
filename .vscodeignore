@@ -1,0 +1,15 @@
+# Ship only the bundles and the manifest assets (SPEC §6 M6).
+**
+!dist/extension.js
+!dist/indexer.worker.js
+!dist/search.worker.js
+!dist/export.worker.js
+!dist/webview.js
+!dist/webview.css
+!images/icon.png
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!LICENSE.md
+!LICENSE.txt

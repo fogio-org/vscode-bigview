@@ -5,6 +5,7 @@
  *   npm run test:integration                 # 1 MB / 10 MB files
  *   BIGVIEW_LARGE=1 npm run test:integration # + 200 MB and 1 GB
  *   BIGVIEW_HUGE=1 npm run test:integration  # + 5 GB (M2 memory acceptance)
+ *   BIGVIEW_GREP=tail npm run test:integration # only tests whose name matches
  */
 import { runTests } from '@vscode/test-electron';
 import * as esbuild from 'esbuild';
@@ -43,6 +44,7 @@ async function main(): Promise<void> {
       BIGVIEW_ROOT: root,
       BIGVIEW_LARGE: process.env.BIGVIEW_LARGE ?? '',
       BIGVIEW_HUGE: process.env.BIGVIEW_HUGE ?? '',
+      BIGVIEW_GREP: process.env.BIGVIEW_GREP ?? '',
     },
   });
 }
