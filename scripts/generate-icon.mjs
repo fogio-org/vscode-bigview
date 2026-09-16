@@ -8,7 +8,7 @@ const SIZE = 640;
 const SS = 3; // samples per axis
 const RADIUS = 120; // same corner radius as the other fogio icons
 
-const BG = [0xb0, 0x7a, 0x52];
+const BG = [0x9a, 0x5c, 0xa3];
 const FG = [0xff, 0xff, 0xff];
 
 const roundRect = (x, y, x0, y0, x1, y1, r) => {
@@ -22,16 +22,17 @@ const capsule = (x, y, ax, ay, bx, by, r) => {
 };
 
 // Glyph: a magnifier over two lines of text — viewing and searching inside a file.
-const lens = { cx: 282, cy: 282, inner: 96, outer: 152 };
+// Same geometry as the 32-unit SVG on fogio.org (×20): stroke 2.4 → 48 px.
+const lens = { cx: 290, cy: 290, inner: 120, outer: 168 };
 
 function shade(x, y) {
   if (!roundRect(x, y, 0, 0, SIZE, SIZE, RADIUS)) return null;
   const d = Math.hypot(x - lens.cx, y - lens.cy);
   const glyph =
     (d >= lens.inner && d <= lens.outer) ||
-    capsule(x, y, 392, 392, 480, 480, 32) ||
-    capsule(x, y, 222, 252, 342, 252, 18) ||
-    capsule(x, y, 222, 312, 306, 312, 18);
+    capsule(x, y, 392, 392, 500, 500, 24) ||
+    capsule(x, y, 230, 250, 350, 250, 24) ||
+    capsule(x, y, 230, 330, 310, 330, 24);
   return glyph ? FG : BG;
 }
 
