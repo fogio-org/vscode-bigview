@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+### Changed
+
+- Update icon
+
 ## 0.1.0
 
 ### Features

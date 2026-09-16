@@ -2,7 +2,7 @@
   "name": "bigview",
   "displayName": "BigView",
   "description": "View, search, filter and tail huge log, JSON Lines and CSV files (gigabytes) without loading them into memory.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "fogio",
   "license": "MIT",
   "icon": "assets/icon.png",
